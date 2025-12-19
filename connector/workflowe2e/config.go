@@ -1,0 +1,83 @@
+package workflowe2e
+
+import "fmt"
+
+// Config definisce la configurazione del connector workflowe2e.
+// Viene caricata dal Collector tramite mapstructure.
+type Config struct {
+	/* Può essere utile per traces con più workflow
+	// WorkflowAttribute è l'attributo (span o resource) usato
+	// per identificare il workflow a cui appartiene una trace.
+	// NON deve essere trace_id.
+	WorkflowAttribute string `mapstructure:"workflow_attribute"`
+	*/
+
+	// E2ELatencyMetricName è il nome della metrica Prometheus
+	// che espone la latenza E2E del workflow (in millisecondi)
+	E2ELatencyMetricName string `mapstructure:"e2e_latency_metric_name"`
+
+	// ServiceLatencyMetricName è il nome della metrica Prometheus
+	// che espone la latenza per singolo servizio (in millisecondi).
+	ServiceLatencyMetricName string `mapstructure:"service_latency_metric_name"`
+
+	// ServiceLatencyMode controlla se e come vengono calcolate
+	// le latenze per singolo microservizio.
+	//
+	// Valori ammessi:
+	// - "none": nessuna metrica per microservizio
+	// - "all": metriche per tutti i microservizi
+	// - "list": solo per i servizi in ServiceAllowList
+	ServiceLatencyMode string `mapstructure:"service_latency_mode"`
+
+	// ServiceAllowList è la lista dei nomi dei microservizi
+	// per cui calcolare le latenze quando ServiceLatencyMode = "list".
+	ServiceAllowList []string `mapstructure:"service_allow_list"`
+
+	// ServiceNameAttribute è l'attributo (span o resource)
+	// che identifica il nome del microservizio.
+	// Es.: "service.name"
+	ServiceNameAttribute string `mapstructure:"service_name_attribute"`
+
+	// EnableHistogram se true userà histogram (consigliato), altrimenti gauge.
+	EnableHistogram bool `mapstructure:"enable_histogram"`
+
+	// Se true, significa che sta usando sia OTel che Istio per generare spans, altrimenti solo OTel
+	UsingIstio bool `mapstructure:"using_istio"`
+}
+
+// Validate verifica la correttezza della configurazione.
+// Viene chiamata automaticamente dal Collector all'avvio.
+func (c *Config) Validate() error {
+	/*
+		if c.WorkflowAttribute == "" {
+			return fmt.Errorf("workflow_attribute must not be empty")
+		}
+	*/
+	if c.E2ELatencyMetricName == "" {
+		return fmt.Errorf("e2e_latency_metric_name must not be empty")
+	}
+
+	if c.ServiceLatencyMode != "none" && c.ServiceLatencyMetricName == "" {
+		return fmt.Errorf("service_latency_metric_name must not be empty when service_latency_mode != none")
+	}
+
+	// Service latency
+	switch c.ServiceLatencyMode {
+	case "none", "all", "list":
+		// ok
+	default:
+		return fmt.Errorf("service_latency_mode must be one of: none, all, list (got %q)", c.ServiceLatencyMode)
+	}
+
+	if c.ServiceLatencyMode == "list" && len(c.ServiceAllowList) == 0 {
+		return fmt.Errorf(
+			"service_allow_list must be set when service_latency_mode = list",
+		)
+	}
+
+	if c.ServiceNameAttribute == "" {
+		return fmt.Errorf("service_name_attribute must not be empty")
+	}
+
+	return nil
+}

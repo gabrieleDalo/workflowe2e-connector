@@ -1,0 +1,41 @@
+package workflowe2e
+
+import (
+	"context"
+
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/connector"
+	"go.opentelemetry.io/collector/consumer"
+)
+
+const typeStr = "workflowe2e" // Indica il nome (tipo) del connector
+
+// Crea una nuova factory per il connector
+func NewFactory() connector.Factory {
+	return connector.NewFactory(
+		component.MustNewType(typeStr),
+		createDefaultConfig,
+		connector.WithTracesToMetrics(
+			createTracesToMetricsConnector,
+			component.StabilityLevelAlpha,
+		),
+	)
+}
+
+// Restituisce la configurazione di default (valori di default per gli attributi) del connector
+func createDefaultConfig() component.Config {
+	return &Config{
+		E2ELatencyMetricName:     "workflow_e2e_latency_ms",
+		ServiceLatencyMetricName: "workflow_service_latency_ms",
+		ServiceLatencyMode:       "none", // default solo latenza E2E
+		ServiceAllowList:         nil,
+		ServiceNameAttribute:     "service.name", // default per OTel spans
+		EnableHistogram:          true,
+		UsingIstio:               false, // default: solo per OTel
+	}
+}
+
+// Crea il connector, che consuma traces e produce metriche
+func createTracesToMetricsConnector(ctx context.Context, params connector.Settings, cfg component.Config, nextConsumer consumer.Metrics) (connector.Traces, error) {
+	return newConnector(ctx, params, cfg, nextConsumer)
+}
