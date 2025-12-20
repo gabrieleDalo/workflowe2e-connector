@@ -75,7 +75,7 @@ func (c *Config) Validate() error {
 		)
 	}
 
-	if c.ServiceNameAttribute == "" {
+	if c.ServiceLatencyMode != "none" && c.ServiceNameAttribute == "" {
 		return fmt.Errorf("service_name_attribute must not be empty")
 	}
 

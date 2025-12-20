@@ -25,8 +25,8 @@ func NewFactory() connector.Factory {
 // Restituisce la configurazione di default (valori di default per gli attributi) del connector
 func createDefaultConfig() component.Config {
 	return &Config{
-		E2ELatencyMetricName:     "workflow_e2e_latency_ms",
-		ServiceLatencyMetricName: "workflow_service_latency_ms",
+		E2ELatencyMetricName:     "workflow_e2e_latency",
+		ServiceLatencyMetricName: "workflow_service_latency",
 		ServiceLatencyMode:       "none", // default solo latenza E2E
 		ServiceAllowList:         nil,
 		ServiceNameAttribute:     "service.name", // default per OTel spans

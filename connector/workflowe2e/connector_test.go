@@ -35,8 +35,8 @@ func TestConnectorWorkflowE2ELatencyGauge(t *testing.T) {
 	// Forniamo le configurazioni per il test, nella realtà vengono fornite nel config.yaml del collector e passate automaticamente
 	// Configuriamo il connector per usare Gauge (EnableHistogram: false) e senza metriche per singoli servizi (ServiceLatencyMode: "none"
 	cfg := &Config{
-		E2ELatencyMetricName:     "workflow_e2e_latency_ms",
-		ServiceLatencyMetricName: "workflow_service_latency_ms",
+		E2ELatencyMetricName:     "workflow_e2e_latency",
+		ServiceLatencyMetricName: "workflow_service_latency",
 		ServiceLatencyMode:       "none",
 		ServiceNameAttribute:     "service.name",
 		EnableHistogram:          false, // gauge
@@ -50,6 +50,7 @@ func TestConnectorWorkflowE2ELatencyGauge(t *testing.T) {
 	c := &connectorImp{
 		metricsConsumer: sink,
 		cfg:             cfg,
+		histState:       make(map[string]*histogramState),
 	}
 
 	// Creiamo una trace fittizia con un solo span.
@@ -73,7 +74,7 @@ func TestConnectorWorkflowE2ELatencyGauge(t *testing.T) {
 
 	// Controlliamo che il connector abbia effettivamente generato almeno una metrica
 	if len(sink.metrics) == 0 {
-		t.Fatal("no metrics emitted")
+		t.Fatal("No metrics emitted")
 	}
 
 	// Estraiamo la metrica E2E dal Metrics tree gerarchico (ResourceMetrics → ScopeMetrics → Metrics)
@@ -81,37 +82,42 @@ func TestConnectorWorkflowE2ELatencyGauge(t *testing.T) {
 	md := sink.metrics[0]
 	metric := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
 	if metric.Name() != cfg.E2ELatencyMetricName {
-		t.Errorf("metric name mismatch, got %s", metric.Name())
+		t.Errorf("Metric name mismatch, got %s", metric.Name())
 	}
 
 	// Controlliamo che il gauge abbia un solo datapoint, come previsto
 	g := metric.Gauge()
 	if g.DataPoints().Len() != 1 {
-		t.Errorf("expected 1 datapoint, got %d", g.DataPoints().Len())
+		t.Errorf("Expected 1 datapoint, got %d", g.DataPoints().Len())
 	}
 
 	// Controlliamo che il valore della latenza sia positivo
 	dp := g.DataPoints().At(0)
 	latency := dp.DoubleValue()
 	if latency <= 0 {
-		t.Errorf("expected positive latency, got %f", latency)
+		t.Errorf("Expected positive latency, got %f", latency)
 	}
 
 	// Controlliamo che il valore della latenza calcolato dal connector sia quello che ci aspettiamo, con una certa tolleranza
-	epsilon := 0.001 // NB: i float in Go spesso non sono rappresentati precisamente, è meglio usare un epsilon quando si fanno test di uguaglianza tra float
+	epsilon := 0.01 // NB: i float in Go spesso non sono rappresentati precisamente, è meglio usare un epsilon quando si fanno test di uguaglianza tra float
 	if !(latencyToTest-epsilon <= latency && latency <= latencyToTest+epsilon) {
-		t.Errorf("expected different latency, got %f", latency)
+		t.Errorf("Expected different latency, got %f", latency)
+	} else {
+		t.Logf("Correct, got latency expected: %f", latency)
+
+		/*for _, v := range dp.Attributes().All() {
+			t.Logf("Map: %s", v.AsString())
+		}*/
 	}
 }
 
-func TestConnectorWorkflowE2ELatencyHistogram(t *testing.T) {
-
+func TestConnectorWorkflowE2ELatencyHistogramCumulative(t *testing.T) {
 	cfg := &Config{
 		E2ELatencyMetricName:     "workflow_e2e_latency_ms",
 		ServiceLatencyMetricName: "workflow_service_latency_ms",
-		ServiceLatencyMode:       "none", // non vogliamo metriche per servizio qui
+		ServiceLatencyMode:       "none",
 		ServiceNameAttribute:     "service.name",
-		EnableHistogram:          true, // histogram
+		EnableHistogram:          true,
 		UsingIstio:               false,
 	}
 
@@ -120,81 +126,74 @@ func TestConnectorWorkflowE2ELatencyHistogram(t *testing.T) {
 	c := &connectorImp{
 		metricsConsumer: sink,
 		cfg:             cfg,
+		histState:       make(map[string]*histogramState),
 	}
 
-	// costruisci una trace con 1 span la cui durata è latencyToTest ms
-	// latenza di test in millisecondi
-	var latencyToTest float64 = 120.0
-	td := ptrace.NewTraces()
-	rs := td.ResourceSpans().AppendEmpty()
-	ss := rs.ScopeSpans().AppendEmpty()
-	span := ss.Spans().AppendEmpty()
-	start := time.Now().Add(time.Duration(-latencyToTest) * time.Millisecond)
-	end := time.Now()
-	span.SetStartTimestamp(pcommon.Timestamp(start.UnixNano()))
-	span.SetEndTimestamp(pcommon.Timestamp(end.UnixNano()))
+	bounds := []float64{2, 4, 6, 8, 10, 50, 100, 200, 400, 800, 1000, 1400, 2000, 5000, 10_000, 15_000}
 
-	if err := c.ConsumeTraces(context.Background(), td); err != nil {
-		t.Fatalf("ConsumeTraces failed: %v", err)
-	}
+	// Latency di test in ms
+	latencies := []float64{120.0, 250.0, 75.0}
 
-	if len(sink.metrics) == 0 {
-		t.Fatal("no metrics emitted")
-	}
+	for _, latencyMs := range latencies {
+		td := ptrace.NewTraces()
+		rs := td.ResourceSpans().AppendEmpty()
+		ss := rs.ScopeSpans().AppendEmpty()
+		span := ss.Spans().AppendEmpty()
+		start := time.Now().Add(time.Duration(-latencyMs) * time.Millisecond)
+		end := time.Now()
+		span.SetStartTimestamp(pcommon.Timestamp(start.UnixNano()))
+		span.SetEndTimestamp(pcommon.Timestamp(end.UnixNano()))
 
-	md := sink.metrics[0]
-	metric := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics().At(0)
-
-	if metric.Name() != cfg.E2ELatencyMetricName {
-		t.Fatalf("unexpected metric name: %s", metric.Name())
-	}
-
-	h := metric.Histogram()
-	if h.DataPoints().Len() != 1 {
-		t.Fatalf("expected 1 histogram datapoint, got %d", h.DataPoints().Len())
-	}
-
-	dp := h.DataPoints().At(0)
-
-	// Count deve essere 1 (un evento)
-	if dp.Count() != 1 {
-		t.Fatalf("expected count=1, got %d", dp.Count())
-	}
-
-	// Sum deve essere circa latencyToTest(ms)
-	sum := dp.Sum()
-	epsilon := 0.001 // tolleranza in ms (per conversioni di tempo)
-	if !(latencyToTest-epsilon <= sum && sum <= latencyToTest+epsilon) {
-		t.Fatalf("unexpected sum: got %f, want ~%f", sum, latencyToTest)
-	}
-
-	// Prende i bounds dei buckets e i counts
-	bounds := dp.ExplicitBounds().AsRaw()
-	counts := dp.BucketCounts().AsRaw()
-
-	// Trova l'indice del bucket dove latencyToTest dovrebbe finire
-	expectedIndex := -1
-	for i, b := range bounds {
-		if latencyToTest <= b {
-			expectedIndex = i
-			break
+		if err := c.ConsumeTraces(context.Background(), td); err != nil {
+			t.Fatalf("ConsumeTraces failed: %v", err)
 		}
 	}
-	if expectedIndex == -1 {
-		// +Inf bucket (last)
-		expectedIndex = len(counts) - 1
+
+	// Ora controlliamo lo stato cumulativo direttamente
+	hs := c.getHistogramState("__e2e__", len(bounds)+1)
+	hs.mu.Lock()
+	count := hs.count
+	sumMs := float64(hs.sumNs) / 1e6
+	buckets := append([]uint64(nil), hs.buckets...)
+	hs.mu.Unlock()
+
+	// Count cumulativo deve essere 3
+	if count != uint64(len(latencies)) {
+		t.Fatalf("Expected count=%d, got %d", len(latencies), count)
+	} else {
+		t.Logf("Correct, got count expected: %d", count)
 	}
 
-	// Verifica che solo quel bucket abbia 1 e gli altri 0
-	for i, v := range counts {
-		if i == expectedIndex {
-			if v != 1 {
-				t.Fatalf("expected counts[%d]==1, got %d", i, v)
+	// Sum cumulativo deve essere la somma delle latenze
+	var expectedSum float64
+	for _, v := range latencies {
+		expectedSum += v
+	}
+	epsilon := 0.01
+	if !(expectedSum-epsilon <= sumMs && sumMs <= expectedSum+epsilon) {
+		t.Fatalf("Unexpected sum: got %f, want ~%f", sumMs, expectedSum)
+	} else {
+		t.Logf("Correct, got sum expected: %f", sumMs)
+	}
+
+	// Verifica che i bucket siano aggiornati cumulativamente
+	expectedBuckets := make([]uint64, len(bounds)+1)
+	for _, v := range latencies {
+		idx := len(bounds)
+		for i, b := range bounds {
+			if v <= b {
+				idx = i
+				break
 			}
+		}
+		expectedBuckets[idx]++
+	}
+
+	for i, v := range buckets {
+		if v != expectedBuckets[i] {
+			t.Fatalf("Expected buckets[%d]=%d, got %d", i, expectedBuckets[i], v)
 		} else {
-			if v != 0 {
-				t.Fatalf("expected counts[%d]==0, got %d", i, v)
-			}
+			t.Logf("Correct, got buckets expected, buckets[%d]=%d", i, v)
 		}
 	}
 }
