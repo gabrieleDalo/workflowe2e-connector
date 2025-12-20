@@ -366,10 +366,18 @@ func (c *connectorImp) Capabilities() consumer.Capabilities {
 // Assunzione: upstream è presente groupbytrace, quindi td contiene gli spans della stessa trace.
 func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
 
+	c.logger.Debug("ConsumeTraces called", zap.Int("resource_spans", td.ResourceSpans().Len()))
+
 	latencyMs, serviceActiveNs, err := c.calculateE2ELatency(td, c.cfg)
 	if err != nil {
 		return nil
 	}
+
+	c.logger.Debug(
+		"E2E latency calculated",
+		zap.Float64("latency_ms", latencyMs),
+		zap.Int("services", len(serviceActiveNs)),
+	)
 
 	md := pmetric.NewMetrics()               // Creazione del contenitore Metrics (root)
 	rm := md.ResourceMetrics().AppendEmpty() // Aggiunge un ResourceMetrics. Qui potresti aggiungere anche attributi di resource, es. rm.Resource().Attributes().PutStr("service.name", "workflow-e2e")
@@ -412,12 +420,14 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 		dp.SetSum(sumMs)
 		dp.BucketCounts().FromRaw(buckets)
 
+		dp.Attributes().PutStr("service_name", e2eKey)
+
 	} else {
 		g := metric.SetEmptyGauge()
 		dp := g.DataPoints().AppendEmpty()
 		dp.SetDoubleValue(latencyMs)
 		dp.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
-		dp.Attributes().PutStr("service-name", e2eKey)
+		dp.Attributes().PutStr("service_name", e2eKey)
 	}
 
 	// Espongo la latenza per i singoli microservizi come metrica, di tipo gauge o histogram
@@ -460,14 +470,14 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 				dp.BucketCounts().FromRaw(buckets)
 
 				// Aggiunge una label alla metrica, con il nome del servizio
-				dp.Attributes().PutStr("service-name", svc)
+				dp.Attributes().PutStr("service_name", svc)
 
 			} else {
 				g := m.SetEmptyGauge()
 				dp := g.DataPoints().AppendEmpty()
 				dp.SetDoubleValue(svcLatencyMs)
 				dp.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
-				dp.Attributes().PutStr("service-name", svc)
+				dp.Attributes().PutStr("service_name", svc)
 			}
 		}
 	}
@@ -655,6 +665,14 @@ func (c *connectorImp) updateHistogram(key string, latencyNs uint64, bounds []fl
 		}
 	}
 	hs.buckets[idx]++
+
+	c.logger.Debug(
+		"Histogram updated",
+		zap.String("key", key),
+		zap.Uint64("count", hs.count),
+		zap.Uint64("sum_ns", hs.sumNs),
+		zap.Any("buckets", hs.buckets),
+	)
 }
 
 // Opzionale, ridefinizione del metodo per avviare il connector
