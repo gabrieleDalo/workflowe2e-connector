@@ -414,7 +414,7 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 	} else {
 		g := metric.SetEmptyGauge()
 		dp := g.DataPoints().AppendEmpty()
-		dp.SetDoubleValue(latencyMs + 100000)
+		dp.SetDoubleValue(latencyMs)
 		dp.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
 		dp.Attributes().PutStr("service_name", e2eKey)
 	}
