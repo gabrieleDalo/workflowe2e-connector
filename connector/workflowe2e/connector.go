@@ -73,6 +73,14 @@ func (c *connectorImp) Capabilities() consumer.Capabilities {
 	return consumer.Capabilities{MutatesData: false}
 }
 
+func keys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // Assunzione: upstream è presente groupbytrace, quindi td contiene gli spans della stessa trace.
 func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
 
@@ -82,6 +90,24 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 
 	c.logger.Debug("DEBUG_LOGS: ConsumeTraces called",
 		zap.Int("span_count", td.SpanCount()),
+	)
+
+	traceIDs := make(map[string]struct{})
+
+	for i := 0; i < td.ResourceSpans().Len(); i++ {
+		rs := td.ResourceSpans().At(i)
+		for j := 0; j < rs.ScopeSpans().Len(); j++ {
+			ss := rs.ScopeSpans().At(j)
+			for k := 0; k < ss.Spans().Len(); k++ {
+				tid := ss.Spans().At(k).TraceID().String()
+				traceIDs[tid] = struct{}{}
+			}
+		}
+	}
+
+	c.logger.Debug("DEBUG_LOGS: trace ids summary",
+		zap.Int("unique_trace_count", len(traceIDs)),
+		zap.Any("trace_ids", keys(traceIDs)),
 	)
 
 	latencyMs, serviceActiveNs, err := c.calculateE2ELatency(td, c.cfg)
@@ -110,6 +136,35 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 		c.logger.Debug("PROVA calculateE2ELatency error", zap.Error(err))
 		return nil
 	}
+
+	attrs := td.ResourceSpans().At(0).Resource().Attributes()
+	attrs.Range(func(k string, v pcommon.Value) bool {
+		c.logger.Debug("DEBUG_LOGS: resource attributes",
+			zap.String("key", k),
+			zap.String("value", v.AsString()),
+		)
+		return true
+	})
+
+	scope := td.ResourceSpans().At(0).ScopeSpans().At(0).Scope().Attributes()
+	scope.Range(func(k string, v pcommon.Value) bool {
+		c.logger.Debug("DEBUG_LOGS: scope attributes",
+			zap.String("key", k),
+			zap.String("value", v.AsString()),
+		)
+		return true
+	})
+
+	spanAttrs := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes()
+	spanAttrs.Range(func(k string, v pcommon.Value) bool {
+		c.logger.Debug("DEBUG_LOGS: span attributes",
+			zap.String("trace_id", td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).TraceID().String()),
+			zap.String("span_name", td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Name()),
+			zap.String("key", k),
+			zap.String("value", v.AsString()),
+		)
+		return true
+	})
 
 	md := pmetric.NewMetrics()               // Creazione del contenitore Metrics (root)
 	rm := md.ResourceMetrics().AppendEmpty() // Aggiunge un ResourceMetrics. Qui potresti aggiungere anche attributi di resource, es. rm.Resource().Attributes().PutStr("service.name", "workflow-e2e")
