@@ -366,8 +366,41 @@ func (c *connectorImp) Capabilities() consumer.Capabilities {
 // Assunzione: upstream è presente groupbytrace, quindi td contiene gli spans della stessa trace.
 func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) error {
 
+	c.logger.Debug("PROVA: ConsumeTraces called",
+		zap.String("marker", "PROVA"),
+		zap.Int("resource_spans_len", td.ResourceSpans().Len()),
+	)
+
+	c.logger.Debug("PROVA: ConsumeTraces called",
+		zap.String("marker", "PROVA"),
+		zap.Int("span_count", td.SpanCount()),
+	)
+
 	latencyMs, serviceActiveNs, err := c.calculateE2ELatency(td, c.cfg)
-	if err != nil {
+	/*if err != nil {
+		return nil
+	}*/
+
+	if err == nil {
+		// prova a estrarre un trace_id rappresentativo (se presente)
+		traceID := ""
+		if td.ResourceSpans().Len() > 0 {
+			rs := td.ResourceSpans().At(0)
+			if rs.ScopeSpans().Len() > 0 {
+				ss := rs.ScopeSpans().At(0)
+				if ss.Spans().Len() > 0 {
+					traceID = ss.Spans().At(0).TraceID().String()
+				}
+			}
+		}
+		c.logger.Debug("PROVA E2E latency computed",
+			zap.String("marker", "PROVA"),
+			zap.String("trace_id", traceID),
+			zap.Float64("latency_ms", latencyMs),
+			zap.Int("num_services", len(serviceActiveNs)),
+		)
+	} else {
+		c.logger.Debug("PROVA calculateE2ELatency error", zap.Error(err))
 		return nil
 	}
 
@@ -519,6 +552,14 @@ func (c *connectorImp) calculateE2ELatency(td ptrace.Traces, cfg *Config) (float
 				start := span.StartTimestamp()
 				end := span.EndTimestamp()
 
+				c.logger.Debug("PROVA span seen",
+					zap.String("marker", "PROVA"),
+					zap.String("trace_id", span.TraceID().String()),
+					zap.String("span_name", span.Name()),
+					zap.Int64("start_ns", int64(start)),
+					zap.Int64("end_ns", int64(end)),
+				)
+
 				if end == 0 {
 					continue
 				}
@@ -595,6 +636,13 @@ func (c *connectorImp) calculateE2ELatency(td ptrace.Traces, cfg *Config) (float
 	}
 
 	latencyMs := float64(maxEnd-minStart) / 1e6
+
+	c.logger.Debug("PROVA trace times summary",
+		zap.String("marker", "PROVA"),
+		zap.String("minStart_time", time.Unix(0, int64(minStart)).Format(time.RFC3339Nano)),
+		zap.String("maxEnd_time", time.Unix(0, int64(maxEnd)).Format(time.RFC3339Nano)),
+		zap.Float64("latency_ms_calc", latencyMs),
+	)
 	return latencyMs, serviceActiveNs, nil
 }
 
@@ -651,10 +699,23 @@ func (c *connectorImp) updateHistogram(key string, latencyNs uint64, bounds []fl
 		}
 	}
 	hs.buckets[idx]++
+
+	c.logger.Debug("PROVA histogram update",
+		zap.String("marker", "PROVA"),
+		zap.String("key", key),
+		zap.Uint64("count", hs.count),
+		zap.Uint64("sum_ns", hs.sumNs),
+		zap.Any("buckets", hs.buckets),
+	)
 }
 
 // Opzionale, ridefinizione del metodo per avviare il connector
 func (c *connectorImp) Start(ctx context.Context, host component.Host) error {
+	if c.logger != nil {
+		c.logger.Info("PROVA connector starting",
+			zap.String("metric_name_e2e", c.cfg.E2ELatencyMetricName), // se hai una Version nel cfg
+		)
+	}
 	return nil
 }
 
