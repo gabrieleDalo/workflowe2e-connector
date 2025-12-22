@@ -33,8 +33,8 @@ func createDefaultConfig() component.Config {
 		ServiceNameAttribute:     "service.name", // default per OTel spans
 		EnableHistogram:          true,
 		UsingIstio:               false,            // default: solo per OTel
-		TraceIdleTimeout:         30 * time.Second, // 30s
-		TraceFlushInterval:       5 * time.Second,  // 5s
+		TraceIdleTimeout:         15 * time.Second, // 30s
+		TraceFlushInterval:       3 * time.Second,  // 5s
 	}
 }
 

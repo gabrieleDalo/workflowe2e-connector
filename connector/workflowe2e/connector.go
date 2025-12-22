@@ -299,16 +299,6 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	const e2eKey = "__e2e__"
 	c.updateHistogram(e2eKey, latencyNs, bounds)
 
-	// Faccio il merge degli intervalli per i singoli servizi e aggiorno l'istogramma
-	for svc, ivs := range serviceIntervals {
-		activeNs := mergeIntervals(ivs)
-		if activeNs == 0 {
-			continue
-		}
-		key := "service:" + svc
-		c.updateHistogram(key, activeNs, bounds)
-	}
-
 	// Creo la metrica per la latenza e2e del workflow e per i singoli servizi (di questa trace)
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
@@ -331,24 +321,36 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	dp.Attributes().PutStr("service_name", e2eKey)
 	hs.mu.Unlock()
 
-	// Service snapshots (solo quelli aggiornati in questa finalizzazione)
-	for svc := range serviceIntervals {
-		key := "service:" + svc
-		m := sm.Metrics().AppendEmpty()
-		m.SetName(c.cfg.ServiceLatencyMetricName)
-		m.SetDescription("Per-service latency (active time)")
-		m.SetUnit("s")
+	if c.cfg.ServiceLatencyMode != "none" {
+		// Faccio il merge degli intervalli per i singoli servizi e aggiorno l'istogramma
+		for svc, ivs := range serviceIntervals {
+			activeNs := mergeIntervals(ivs)
+			if activeNs == 0 {
+				continue
+			}
+			key := "service:" + svc
+			c.updateHistogram(key, activeNs, bounds)
+		}
 
-		hs := c.getHistogramState(key, len(bounds)+1)
-		hs.mu.Lock()
-		dp := m.SetEmptyHistogram().DataPoints().AppendEmpty()
-		dp.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
-		dp.ExplicitBounds().FromRaw(bounds)
-		dp.SetCount(hs.count)
-		dp.SetSum(float64(hs.sumNs) / 1e9) // La somma è in secondi
-		dp.BucketCounts().FromRaw(append([]uint64(nil), hs.buckets...))
-		dp.Attributes().PutStr("service_name", svc)
-		hs.mu.Unlock()
+		// Service snapshots (solo quelli aggiornati in questa finalizzazione)
+		for svc := range serviceIntervals {
+			key := "service:" + svc
+			m := sm.Metrics().AppendEmpty()
+			m.SetName(c.cfg.ServiceLatencyMetricName)
+			m.SetDescription("Per-service latency (active time)")
+			m.SetUnit("s")
+
+			hs := c.getHistogramState(key, len(bounds)+1)
+			hs.mu.Lock()
+			dp := m.SetEmptyHistogram().DataPoints().AppendEmpty()
+			dp.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
+			dp.ExplicitBounds().FromRaw(bounds)
+			dp.SetCount(hs.count)
+			dp.SetSum(float64(hs.sumNs) / 1e9) // La somma è in secondi
+			dp.BucketCounts().FromRaw(append([]uint64(nil), hs.buckets...))
+			dp.Attributes().PutStr("service_name", svc)
+			hs.mu.Unlock()
+		}
 	}
 
 	// "Esporto" la metrica a Prometheus (o al consumer)
@@ -375,15 +377,15 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 
 	// Come prima cosa raccolgo info per ogni trace presente nel batch
 	traceIDs := make(map[string]struct{})
-	preExisting := make(map[string]bool)   // Usata per sapere se una trace era già esistente nello stato prima di questo batch
-	batchAllEnded := make(map[string]bool) // Usata per sapere se tutte le span del batch per una trace sono terminate (hanno endTime != 0)
+	//preExisting := make(map[string]bool)   // Usata per sapere se una trace era già esistente nello stato prima di questo batch
+	//batchAllEnded := make(map[string]bool) // Usata per sapere se tutte le span del batch per una trace sono terminate (hanno endTime != 0)
 
 	// Segno quali traces esistono già (hanno già uno stato)
-	c.tracesMu.Lock()
+	/*c.tracesMu.Lock()
 	for tid := range c.traces {
 		preExisting[tid] = true
 	}
-	c.tracesMu.Unlock()
+	c.tracesMu.Unlock()*/
 
 	// Aggiorno lo stato per ogni span e raccolgo se nel batch
 	for i := 0; i < td.ResourceSpans().Len(); i++ {
@@ -418,20 +420,20 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 
 				// Aggiorno lo stato per la trace
 				c.updateTraceStateForSpan(tid, start, end, svc)
-
-				// Aggiorna il flag batchAllEnded, se per questa trace troviamo un span con end==0 => non tutti gli spans sono terminati => non possiamo finalizzare la trace
-				if _, ok := batchAllEnded[tid]; !ok {
-					// se non presente assume allEnded true finché non trovi un end==0
-					if end == 0 {
-						batchAllEnded[tid] = false
+				/*
+					// Aggiorna il flag batchAllEnded, se per questa trace troviamo un span con end==0 => non tutti gli spans sono terminati => non possiamo finalizzare la trace
+					if _, ok := batchAllEnded[tid]; !ok {
+						// se non presente assume allEnded true finché non trovi un end==0
+						if end == 0 {
+							batchAllEnded[tid] = false
+						} else {
+							batchAllEnded[tid] = true
+						}
 					} else {
-						batchAllEnded[tid] = true
-					}
-				} else {
-					if end == 0 {
-						batchAllEnded[tid] = false
-					}
-				}
+						if end == 0 {
+							batchAllEnded[tid] = false
+						}
+					}*/
 			}
 		}
 	}
@@ -444,13 +446,13 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 	// Se la trace NON esisteva prima nello stato e TUTTE le span viste in questo batch hanno end != 0,
 	// allora molto probabilmente è stata ricevuta la trace completa => finalizzo subito per evitare delay
 	// Se la trace era già presente (partial data vista prima), la lascio al flusher per evitare doppie emissioni
-	for tid := range traceIDs {
+	/*for tid := range traceIDs {
 		if !preExisting[tid] {
 			if allEnded, ok := batchAllEnded[tid]; ok && allEnded {
 				c.finalizeTrace(tid) // Finalizzo subito la traccia
 			}
 		}
-	}
+	}*/
 
 	// NOTE: qui NON emetto metriche per traces parziali; il flusher in Start() si occuperà di
 	// finalizzare eventuali traces che restano inert per traceIdleTimeout.
