@@ -1,6 +1,9 @@
 package workflowe2e
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Config definisce la configurazione del connector workflowe2e.
 // Viene caricata dal Collector tramite mapstructure.
@@ -43,6 +46,14 @@ type Config struct {
 
 	// Se true, significa che sta usando sia OTel che Istio per generare spans, altrimenti solo OTel
 	UsingIstio bool `mapstructure:"using_istio"`
+
+	// TraceIdleTimeout è il tempo di inattività dopo il quale una trace
+	// viene considerata completa e finalizzata (es. "30s").
+	TraceIdleTimeout time.Duration `mapstructure:"trace_idle_timeout"`
+
+	// TraceFlushInterval è la frequenza con cui il connector controlla
+	// le traces e finalizza quelle scadute (es. "5s").
+	TraceFlushInterval time.Duration `mapstructure:"trace_flush_interval"`
 }
 
 // Validate verifica la correttezza della configurazione.
@@ -77,6 +88,14 @@ func (c *Config) Validate() error {
 
 	if c.ServiceLatencyMode != "none" && c.ServiceNameAttribute == "" {
 		return fmt.Errorf("service_name_attribute must not be empty")
+	}
+
+	// Convalida dei timeout
+	if c.TraceIdleTimeout < 0 {
+		return fmt.Errorf("trace_idle_timeout must be >= 0")
+	}
+	if c.TraceFlushInterval < 0 {
+		return fmt.Errorf("trace_flush_interval must be >= 0")
 	}
 
 	return nil

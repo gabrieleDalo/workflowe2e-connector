@@ -2,6 +2,7 @@ package workflowe2e
 
 import (
 	"context"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/connector"
@@ -31,7 +32,9 @@ func createDefaultConfig() component.Config {
 		ServiceAllowList:         nil,
 		ServiceNameAttribute:     "service.name", // default per OTel spans
 		EnableHistogram:          true,
-		UsingIstio:               false, // default: solo per OTel
+		UsingIstio:               false,            // default: solo per OTel
+		TraceIdleTimeout:         30 * time.Second, // 30s
+		TraceFlushInterval:       5 * time.Second,  // 5s
 	}
 }
 
