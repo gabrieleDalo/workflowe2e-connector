@@ -407,7 +407,7 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		dp.SetSum(float64(sumNs) / 1e9) // somma in secondi
 		dp.BucketCounts().FromRaw(bucketsCopy)
 		dp.Attributes().PutStr("service_name", attrsSvc)
-		dp.Attributes().PutInt("debug_tick", time.Now().Unix())
+		//dp.Attributes().PutInt("debug_tick", time.Now().Unix()) // Con questo funziona correttamente ma vengono create esponenzialmente metriche nuove poichè cambia la label tick
 	}
 
 	// Emetto lo snapshot in un'unica chiamata
