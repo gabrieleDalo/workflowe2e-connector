@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,10 @@ import (
 )
 
 var maxTimestamp = pcommon.Timestamp(^uint64(0))
+
+// Bounds dei buckets (in secondi, coerente per Prometheus)
+// centralizziamo i bounds così tutte le funzioni usano lo stesso set
+var defaultBounds = []float64{0.002, 0.004, 0.006, 0.008, 0.01, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.4, 2.0, 5.0, 10.0, 15.0}
 
 // Stato cumulativo di un histogram
 // NB: lo stato è in memoria del processo. Se il collector si riavvia lo stato viene perso e gli histogram ripartono da zero
@@ -292,78 +297,107 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	latencyNs := uint64(maxEnd - minStart)
 	latencyMs := float64(latencyNs) / 1e6
 
-	// Bounds dei buckets (in secondi, coerente per Prometheus)
-	bounds := []float64{0.002, 0.004, 0.006, 0.008, 0.01, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.4, 2.0, 5.0, 10.0, 15.0}
-
-	// Aggiorno l'istogramma cumulativo E2E
+	// Aggiorno l'istogramma cumulativo E2E (stato in memoria)
 	const e2eKey = "__e2e__"
-	c.updateHistogram(e2eKey, latencyNs, bounds)
+	c.updateHistogram(e2eKey, latencyNs, defaultBounds)
 
-	// Creo la metrica per la latenza e2e del workflow e per i singoli servizi (di questa trace)
-	md := pmetric.NewMetrics()
-	rm := md.ResourceMetrics().AppendEmpty()
-	sm := rm.ScopeMetrics().AppendEmpty()
-
-	// E2E snapshot
-	h := sm.Metrics().AppendEmpty()
-	h.SetName(c.cfg.E2ELatencyMetricName)
-	h.SetDescription("End-to-end workflow latency")
-	h.SetUnit("s")
-
-	hs := c.getHistogramState(e2eKey, len(bounds)+1)
-	hs.mu.Lock()
-	dp := h.SetEmptyHistogram().DataPoints().AppendEmpty()
-	dp.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
-	dp.ExplicitBounds().FromRaw(bounds)
-	dp.SetCount(hs.count)
-	dp.SetSum(float64(hs.sumNs) / 1e9) // La somma è in secondi
-	dp.BucketCounts().FromRaw(append([]uint64(nil), hs.buckets...))
-	dp.Attributes().PutStr("service_name", e2eKey)
-	hs.mu.Unlock()
-
+	// Se richiesto, Faccio il merge degli intervalli per i singoli servizi e aggiorno l'istogramma (stato in memoria)
 	if c.cfg.ServiceLatencyMode != "none" {
-		// Faccio il merge degli intervalli per i singoli servizi e aggiorno l'istogramma
 		for svc, ivs := range serviceIntervals {
 			activeNs := mergeIntervals(ivs)
 			if activeNs == 0 {
 				continue
 			}
 			key := "service:" + svc
-			c.updateHistogram(key, activeNs, bounds)
-		}
-
-		// Service snapshots (solo quelli aggiornati in questa finalizzazione)
-		for svc := range serviceIntervals {
-			key := "service:" + svc
-			m := sm.Metrics().AppendEmpty()
-			m.SetName(c.cfg.ServiceLatencyMetricName)
-			m.SetDescription("Per-service latency (active time)")
-			m.SetUnit("s")
-
-			hs := c.getHistogramState(key, len(bounds)+1)
-			hs.mu.Lock()
-			dp := m.SetEmptyHistogram().DataPoints().AppendEmpty()
-			dp.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
-			dp.ExplicitBounds().FromRaw(bounds)
-			dp.SetCount(hs.count)
-			dp.SetSum(float64(hs.sumNs) / 1e9) // La somma è in secondi
-			dp.BucketCounts().FromRaw(append([]uint64(nil), hs.buckets...))
-			dp.Attributes().PutStr("service_name", svc)
-			hs.mu.Unlock()
+			c.updateHistogram(key, activeNs, defaultBounds)
 		}
 	}
 
-	// "Esporto" la metrica a Prometheus (o al consumer)
-	if err := c.metricsConsumer.ConsumeMetrics(context.Background(), md); err != nil {
+	// NOTA: non emettiamo più le metriche direttamente qui con ConsumeMetrics per evitare emissioni duplicate
+	// e problemi di timing con Prometheus scrapes. Aggiorniamo solo lo stato interno (histState) e lasciamo
+	// che il flusher periodico (emitHistSnapshot) esponga lo snapshot coerente.
+	if c.logger != nil {
+		c.logger.Debug("DEBUG_LOGS: finalizeTrace updated internal histogram state (not emitted)",
+			zap.String("trace_id", traceID),
+			zap.Float64("latency_ms", latencyMs),
+		)
+	}
+}
+
+// emitHistSnapshot costruisce un pmetric.Metrics snapshot a partire dallo stato cumulativo histState
+// e lo invia al consumer (una volta per snapshot).
+// NON imposta timestamp espliciti sui datapoint (lascia che l'exporter / Prometheus handle lo scrape time).
+func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
+	// Primo: copia i riferimenti agli histogram sotto lock per evitare holding prolungati della map
+	c.histMu.RLock()
+	if len(c.histState) == 0 {
+		c.histMu.RUnlock()
+		// niente da emettere
+		return
+	}
+	// copia shallow delle chiavi e dei puntatori
+	local := make(map[string]*histogramState, len(c.histState))
+	for k, v := range c.histState {
+		local[k] = v
+	}
+	c.histMu.RUnlock()
+
+	// Costruisco il Metrics payload
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+	sm := rm.ScopeMetrics().AppendEmpty()
+
+	// Per ogni histogram copia in locale lo stato (count,sum,buckets) sotto hs.mu
+	for key, hs := range local {
+		hs.mu.Lock()
+		count := hs.count
+		sumNs := hs.sumNs
+		bucketsCopy := append([]uint64(nil), hs.buckets...)
+		hs.mu.Unlock()
+
+		// Decido che nome di metrica usare
+		var metricName string
+		attrsSvc := ""
+		if key == "__e2e__" {
+			metricName = c.cfg.E2ELatencyMetricName
+			attrsSvc = "__e2e__"
+		} else if strings.HasPrefix(key, "service:") {
+			metricName = c.cfg.ServiceLatencyMetricName
+			attrsSvc = strings.TrimPrefix(key, "service:")
+		} else {
+			metricName = c.cfg.E2ELatencyMetricName
+			attrsSvc = key
+		}
+
+		// Appendo la metrica (histogram) al payload
+		m := sm.Metrics().AppendEmpty()
+		m.SetName(metricName)
+		if metricName == c.cfg.E2ELatencyMetricName {
+			m.SetDescription("End-to-end workflow latency")
+		} else {
+			m.SetDescription("Per-service latency (active time)")
+		}
+		m.SetUnit("s")
+
+		h := m.SetEmptyHistogram()
+		dp := h.DataPoints().AppendEmpty()
+		// non impostiamo timestamp espliciti: lasciamo all'exporter / Prometheus il tempo dello scrape
+		dp.ExplicitBounds().FromRaw(defaultBounds)
+		dp.SetCount(count)
+		dp.SetSum(float64(sumNs) / 1e9) // somma in secondi
+		dp.BucketCounts().FromRaw(bucketsCopy)
+		dp.Attributes().PutStr("service_name", attrsSvc)
+	}
+
+	// Emetto lo snapshot in un'unica chiamata
+	if err := c.metricsConsumer.ConsumeMetrics(ctx, md); err != nil {
 		if c.logger != nil {
-			c.logger.Error("Failed to emit finalized trace metric", zap.Error(err))
+			c.logger.Error("Failed to emit histogram snapshot", zap.Error(err))
 		}
 	} else {
 		if c.logger != nil {
-			c.logger.Debug("DEBUG_LOGS: finalizeTrace emitted metric",
-				zap.String("trace_id", traceID),
-				zap.Float64("latency_ms", latencyMs),
-			)
+			c.logger.Debug("DEBUG_LOGS: emitHistSnapshot emitted histogram snapshot",
+				zap.Int("series", len(local)))
 		}
 	}
 }
@@ -420,20 +454,6 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 
 				// Aggiorno lo stato per la trace
 				c.updateTraceStateForSpan(tid, start, end, svc)
-				/*
-					// Aggiorna il flag batchAllEnded, se per questa trace troviamo un span con end==0 => non tutti gli spans sono terminati => non possiamo finalizzare la trace
-					if _, ok := batchAllEnded[tid]; !ok {
-						// se non presente assume allEnded true finché non trovi un end==0
-						if end == 0 {
-							batchAllEnded[tid] = false
-						} else {
-							batchAllEnded[tid] = true
-						}
-					} else {
-						if end == 0 {
-							batchAllEnded[tid] = false
-						}
-					}*/
 			}
 		}
 	}
@@ -443,218 +463,11 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 		zap.Any("trace_ids", keys(traceIDs)),
 	)
 
-	// Se la trace NON esisteva prima nello stato e TUTTE le span viste in questo batch hanno end != 0,
-	// allora molto probabilmente è stata ricevuta la trace completa => finalizzo subito per evitare delay
-	// Se la trace era già presente (partial data vista prima), la lascio al flusher per evitare doppie emissioni
-	/*for tid := range traceIDs {
-		if !preExisting[tid] {
-			if allEnded, ok := batchAllEnded[tid]; ok && allEnded {
-				c.finalizeTrace(tid) // Finalizzo subito la traccia
-			}
-		}
-	}*/
-
 	// NOTE: qui NON emetto metriche per traces parziali; il flusher in Start() si occuperà di
 	// finalizzare eventuali traces che restano inert per traceIdleTimeout.
 
-	/*
-		// --- il resto del tuo codice originale resta per compatibilità: calcolo istantaneo E2E (se vuoi tenerlo)
-		latencyMs, serviceActiveNs, err := c.calculateE2ELatency(td, c.cfg)
-		//if err != nil {
-		//	return nil
-		//}
-
-		if err == nil {
-			// prova a estrarre un trace_id rappresentativo (se presente)
-			traceID := ""
-			if td.ResourceSpans().Len() > 0 {
-				rs := td.ResourceSpans().At(0)
-				if rs.ScopeSpans().Len() > 0 {
-					ss := rs.ScopeSpans().At(0)
-					if ss.Spans().Len() > 0 {
-						traceID = ss.Spans().At(0).TraceID().String()
-					}
-				}
-			}
-			c.logger.Debug("DEBUG_LOGS: E2E latency computed",
-				zap.String("trace_id", traceID),
-				zap.Float64("latency_ms", latencyMs),
-				zap.Int("num_services", len(serviceActiveNs)),
-			)
-		} else {
-			c.logger.Debug("PROVA calculateE2ELatency error", zap.Error(err))
-			// non return: manteniamo comportamento precedente (non emettiamo metriche qui)
-		}
-
-		// Log delle resource / scope / span attributes (come prima)
-		if td.ResourceSpans().Len() > 0 {
-			attrs := td.ResourceSpans().At(0).Resource().Attributes()
-			attrs.Range(func(k string, v pcommon.Value) bool {
-				c.logger.Debug("DEBUG_LOGS: resource attributes",
-					zap.String("key", k),
-					zap.String("value", v.AsString()),
-				)
-				return true
-			})
-		}
-
-		if td.ResourceSpans().Len() > 0 && td.ResourceSpans().At(0).ScopeSpans().Len() > 0 {
-			scope := td.ResourceSpans().At(0).ScopeSpans().At(0).Scope().Attributes()
-			scope.Range(func(k string, v pcommon.Value) bool {
-				c.logger.Debug("DEBUG_LOGS: scope attributes",
-					zap.String("key", k),
-					zap.String("value", v.AsString()),
-				)
-				return true
-			})
-		}
-
-		if td.ResourceSpans().Len() > 0 && td.ResourceSpans().At(0).ScopeSpans().Len() > 0 && td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().Len() > 0 {
-			spanAttrs := td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Attributes()
-			spanAttrs.Range(func(k string, v pcommon.Value) bool {
-				c.logger.Debug("DEBUG_LOGS: span attributes",
-					zap.String("trace_id", td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).TraceID().String()),
-					zap.String("span_name", td.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Name()),
-					zap.String("key", k),
-					zap.String("value", v.AsString()),
-				)
-				return true
-			})
-		}
-	*/
-	// la produzione delle metriche cumulative degli histogram rimane a finalizeTrace (o ad updateHistogram + snapshot)
-	// qui NON costruiamo metriche (se vuoi comunque emettere snapshot anche qui, puoi farlo,
-	// ma aumenta il rischio di emissioni duplicate - preferiamo flusher/finalize per unicità).
-
 	return nil
 }
-
-// Calcola la latenza end-to-end (ms) di una trace
-// Restituisce inoltre una mappa service -> durata attiva (ns)
-// NB: td è assunto come "trace completa" (groupbytrace upstream).
-/*
-func (c *connectorImp) calculateE2ELatency(td ptrace.Traces, cfg *Config) (float64, map[string]uint64, error) {
-
-	if td.ResourceSpans().Len() == 0 {
-		return 0, nil, errors.New("No spans available")
-	}
-
-	var minStart pcommon.Timestamp = maxTimestamp
-	var maxEnd pcommon.Timestamp = 0
-
-	serviceIntervals := make(map[string][]interval)
-	enableService := cfg.ServiceLatencyMode != "none"
-
-	allowListMode := cfg.ServiceLatencyMode == "list"
-	allowMap := make(map[string]struct{}, len(cfg.ServiceAllowList))
-	if allowListMode {
-		for _, s := range cfg.ServiceAllowList {
-			allowMap[s] = struct{}{}
-		}
-	}
-
-	for i := 0; i < td.ResourceSpans().Len(); i++ {
-		rs := td.ResourceSpans().At(i)
-		for j := 0; j < rs.ScopeSpans().Len(); j++ {
-			ss := rs.ScopeSpans().At(j)
-			spans := ss.Spans()
-			for k := 0; k < spans.Len(); k++ {
-				span := spans.At(k)
-				start := span.StartTimestamp()
-				end := span.EndTimestamp()
-
-				c.logger.Debug("DEBUG_LOGS: span seen",
-					zap.String("trace_id", span.TraceID().String()),
-					zap.String("span_name", span.Name()),
-					zap.Int64("start_ns", int64(start)),
-					zap.Int64("end_ns", int64(end)),
-				)
-
-				if end == 0 {
-					continue
-				}
-
-				if start < minStart {
-					minStart = start
-				}
-				if end > maxEnd {
-					maxEnd = end
-				}
-
-				if !enableService {
-					continue
-				}
-
-				var svc string
-				if cfg.UsingIstio {
-					if v, ok := span.Attributes().Get(cfg.ServiceNameAttribute); ok {
-						svc = v.AsString()
-					}
-				}
-				if svc == "" {
-					if v, ok := rs.Resource().Attributes().Get(cfg.ServiceNameAttribute); ok {
-						svc = v.AsString()
-					}
-				}
-				if svc == "" {
-					svc = "unknown"
-				}
-
-				if allowListMode {
-					if _, ok := allowMap[svc]; !ok {
-						continue
-					}
-				}
-
-				// Alla fine del loop, per ogni servizio avrò tutti gli intervalli temporali dei suoi spans
-				serviceIntervals[svc] = append(serviceIntervals[svc], interval{start, end})
-			}
-		}
-	}
-
-	serviceActiveNs := make(map[string]uint64)
-	// Per ogni servizio, fa il merge degli intervalli per calcolare la latenza
-	for svc, ivs := range serviceIntervals {
-
-		// Ordina gli intervalli di uno span sulla base dell'istante di inizio
-		sort.Slice(ivs, func(i, j int) bool {
-			return ivs[i].start < ivs[j].start
-		})
-
-		cur := ivs[0] // Consideriamo il primo intervallo
-		var total uint64
-
-		// Loop per il merge, prende ogni intervallo successivo e lo confronti con cur
-		for i := 1; i < len(ivs); i++ {
-			// Controlla se l'intervallo inizia mentre uno è ancora attivo (lo span non è terminato)
-			if ivs[i].start <= cur.end {
-				if ivs[i].end > cur.end { // Se lo è, controlla se finisce dopo
-					cur.end = ivs[i].end // In tal caso aggiorno il tempo di fine
-				}
-			} else { // Se no, salvo il tempo trascorso in attività e passo al nuovo intervallo
-				total += uint64(cur.end - cur.start)
-				cur = ivs[i]
-			}
-		}
-		total += uint64(cur.end - cur.start)
-
-		serviceActiveNs[svc] = total
-	}
-
-	if minStart == maxTimestamp || maxEnd == 0 {
-		return 0, nil, errors.New("Invalid timestamps")
-	}
-
-	latencyMs := float64(maxEnd-minStart) / 1e6
-
-	c.logger.Debug("DEBUG_LOGS: trace times summary",
-		zap.String("minStart_time", time.Unix(0, int64(minStart)).Format(time.RFC3339Nano)),
-		zap.String("maxEnd_time", time.Unix(0, int64(maxEnd)).Format(time.RFC3339Nano)),
-		zap.Float64("latency_ms_calc", latencyMs),
-	)
-	return latencyMs, serviceActiveNs, nil
-}
-*/
 
 // Ridefinizione del metodo per avviare il connector
 func (c *connectorImp) Start(ctx context.Context, host component.Host) error {
@@ -666,6 +479,7 @@ func (c *connectorImp) Start(ctx context.Context, host component.Host) error {
 
 	// Lancia la goroutine di flush periodico per finalizzare le traces inattive (esegue in background)
 	// Ogni traceFlushInterval il flusher controlla tutte le trace e, per ognuna, verifica se è passato più di traceIdleTimeout dall’ultima volta che ha visto uno span di quella trace. Se sì → la finalizza
+	// Inoltre ad ogni tick emettiamo lo snapshot (emitHistSnapshot) degli histogram cumulativi.
 	go func() {
 		// Crea un Ticker che invia un evento sul canale ticker.C ogni traceFlushInterval. È il meccanismo per eseguire periodicamente un compito (in questo caso il flush)
 		ticker := time.NewTicker(c.traceFlushInterval)
@@ -702,6 +516,9 @@ func (c *connectorImp) Start(ctx context.Context, host component.Host) error {
 				for _, tid := range toFinalize {
 					c.finalizeTrace(tid)
 				}
+
+				// Dopo avere finalizzato traces inattive, emetto uno snapshot coerente degli histogram cumulativi
+				c.emitHistSnapshot(context.Background())
 			// Quando il Collector chiama Shutdown (o il contesto viene cancellato), la goroutine esce in modo pulito
 			case <-ctx.Done():
 				return
@@ -725,5 +542,7 @@ func (c *connectorImp) Shutdown(ctx context.Context) error {
 	for _, tid := range all {
 		c.finalizeTrace(tid)
 	}
+	// Emitto uno snapshot finale
+	c.emitHistSnapshot(context.Background())
 	return nil
 }
