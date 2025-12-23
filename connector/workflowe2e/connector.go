@@ -26,10 +26,11 @@ var defaultBounds = []float64{0.002, 0.004, 0.006, 0.008, 0.01, 0.05, 0.1, 0.2, 
 // Stato cumulativo di un histogram
 // NB: lo stato è in memoria del processo. Se il collector si riavvia lo stato viene perso e gli histogram ripartono da zero
 type histogramState struct {
-	mu      sync.Mutex // mutex per thread-safety
-	count   uint64     // totale osservazioni
-	sumNs   uint64     // totale latenza
-	buckets []uint64   // buckets cumulativi
+	mu      sync.Mutex        // mutex per thread-safety
+	count   uint64            // totale osservazioni
+	sumNs   uint64            // totale latenza
+	buckets []uint64          // buckets cumulativi
+	start   pcommon.Timestamp // start timestamp della serie cumulativa (impostato alla creazione)
 }
 
 // Intervallo usato per il merge degli spans di uno stesso servizio
@@ -184,12 +185,23 @@ func (c *connectorImp) getHistogramState(key string, bucketCount int) *histogram
 		return hs
 	}
 
+	now := pcommon.Timestamp(time.Now().UnixNano())
+
 	// Crea un nuovo histogramState vuoto: count e sumNs sono implicitamente 0.
 	// buckets è una slice di lunghezza bucketCount, inizializzata a zero
 	hs = &histogramState{
 		buckets: make([]uint64, bucketCount),
+		start:   now,
 	}
 	c.histState[key] = hs // Memorizza il nuovo stato nella mappa
+
+	if c.logger != nil {
+		c.logger.Debug("DEBUG_LOGS: created new histogramState",
+			zap.String("key", key),
+			zap.Int("buckets_len", bucketCount),
+			zap.Int64("start_ns", int64(now)),
+		)
+	}
 
 	return hs
 }
@@ -317,7 +329,7 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	// e problemi di timing con Prometheus scrapes. Aggiorniamo solo lo stato interno (histState) e lasciamo
 	// che il flusher periodico (emitHistSnapshot) esponga lo snapshot coerente.
 	if c.logger != nil {
-		c.logger.Debug("DEBUG_LOGS: finalizeTrace updated internal histogram state (not emitted)",
+		c.logger.Debug("DEBUG_LOGS: finalizeTrace",
 			zap.String("trace_id", traceID),
 			zap.Float64("latency_ms", latencyMs),
 		)
@@ -353,6 +365,7 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		count := hs.count
 		sumNs := hs.sumNs
 		bucketsCopy := append([]uint64(nil), hs.buckets...)
+		startTs := hs.start
 		hs.mu.Unlock()
 
 		// Decido che nome di metrica usare
@@ -381,7 +394,8 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 
 		h := m.SetEmptyHistogram()
 		dp := h.DataPoints().AppendEmpty()
-		// non impostiamo timestamp espliciti: lasciamo all'exporter / Prometheus il tempo dello scrape
+		// Settiamo lo StartTimestamp in modo che il prometheus-exporter possa esporre la serie come cumulativa
+		dp.SetStartTimestamp(startTs)
 		dp.ExplicitBounds().FromRaw(defaultBounds)
 		dp.SetCount(count)
 		dp.SetSum(float64(sumNs) / 1e9) // somma in secondi
