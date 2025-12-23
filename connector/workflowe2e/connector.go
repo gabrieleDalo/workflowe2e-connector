@@ -401,6 +401,9 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		dp.SetSum(float64(sumNs) / 1e9) // somma in secondi
 		dp.BucketCounts().FromRaw(bucketsCopy)
 		dp.Attributes().PutStr("service_name", attrsSvc)
+
+		// Aggiungi questa riga per forzare Prometheus a vedere un "nuovo" datapoint
+		dp.SetStartTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
 	}
 
 	// Emetto lo snapshot in un'unica chiamata
