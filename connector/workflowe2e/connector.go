@@ -906,10 +906,6 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 			zap.Float64("latency_ms", latencyMs),
 		)
 	}
-
-	// Emit immediato (sincrono) per rendere disponbili i valori all'OTel exporter subito dopo il finalize.
-	// Nota: l'emit è serializzato dentro emitHistSnapshot mediante emitMu per evitare race nella registry del prometheus exporter.
-	c.emitHistSnapshot(context.Background())
 }
 
 // emitHistSnapshot costruisce un pmetric.Metrics snapshot a partire dallo stato cumulativo histState
@@ -920,23 +916,28 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 	c.histMu.RLock()
 	if len(c.histState) == 0 {
 		c.histMu.RUnlock()
-		// niente da emettere
 		return
 	}
+
+	keys := make([]string, 0, len(c.histState))
+	for k := range c.histState {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	// copia shallow delle chiavi e dei puntatori
-	local := make(map[string]*histogramState, len(c.histState))
-	for k, v := range c.histState {
-		local[k] = v
+	local := make(map[string]*histogramState, len(keys))
+	for _, k := range keys {
+		local[k] = c.histState[k]
 	}
 	c.histMu.RUnlock()
 
 	// Costruisco il Metrics payload
 	md := pmetric.NewMetrics()
-	rm := md.ResourceMetrics().AppendEmpty()
-	sm := rm.ScopeMetrics().AppendEmpty()
 
 	// Per ogni histogram copia in locale lo stato (count,sum,buckets) sotto hs.mu
-	for key, hs := range local {
+	for _, key := range keys {
+		hs := local[key]
+
 		hs.mu.Lock()
 		count := hs.count
 		sumNs := hs.sumNs
@@ -944,59 +945,66 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		startTs := hs.start
 		hs.mu.Unlock()
 
-		// Decido che nome di metrica usare
 		var metricName string
-		attrsSvc := ""
+		var serviceName string
+
+		// Decido che nome di metrica usare
 		if key == "__e2e__" {
 			metricName = c.cfg.E2ELatencyMetricName
-			attrsSvc = "__e2e__"
+			serviceName = "__e2e__"
 		} else if strings.HasPrefix(key, "service:") {
 			metricName = c.cfg.ServiceLatencyMetricName
-			attrsSvc = strings.TrimPrefix(key, "service:")
+			serviceName = strings.TrimPrefix(key, "service:")
 		} else {
 			metricName = c.cfg.E2ELatencyMetricName
-			attrsSvc = key
+			serviceName = key
 		}
+
+		// === ResourceMetrics per serie (pattern spanmetrics) ===
+		rm := md.ResourceMetrics().AppendEmpty()
+		rm.Resource().Attributes().PutStr("service.name", serviceName)
+
+		sm := rm.ScopeMetrics().AppendEmpty()
+		sm.Scope().SetName("workflowe2e")
 
 		// Appendo la metrica (histogram) al payload
 		m := sm.Metrics().AppendEmpty()
 		m.SetName(metricName)
+		m.SetUnit("s")
+
 		if metricName == c.cfg.E2ELatencyMetricName {
 			m.SetDescription("End-to-end workflow latency")
 		} else {
 			m.SetDescription("Per-service latency (active time)")
 		}
-		m.SetUnit("s")
 
 		h := m.SetEmptyHistogram()
 		dp := h.DataPoints().AppendEmpty()
-		// Settiamo lo StartTimestamp in modo che il prometheus-exporter possa esporre la serie come cumulativa
-		dp.SetStartTimestamp(startTs)
-		// Impostiamo anche il timestamp di campionamento (non cambia l'identità della serie)
-		//dp.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano()))
+
+		dp.SetStartTimestamp(startTs) // Settiamo lo StartTimestamp in modo che il prometheus-exporter possa esporre la serie come cumulativa
+
 		dp.ExplicitBounds().FromRaw(defaultBounds)
 		dp.SetCount(count)
-		dp.SetSum(float64(sumNs) / 1e9) // somma in secondi
+		dp.SetSum(float64(sumNs) / 1e9)
 		dp.BucketCounts().FromRaw(bucketsCopy)
-		dp.Attributes().PutStr("service_name", attrsSvc)
 
-		// NOTA: rimosso SetStartTimestamp(pcommon.Timestamp(time.Now().UnixNano())) che ricreava la serie
+		// Label a livello datapoint (ridondante ma utile)
+		dp.Attributes().PutStr("service_name", serviceName)
 	}
 
 	// Serializza le emissioni verso il metricsConsumer per evitare race nella registry dell'exporter
 	c.emitMu.Lock()
 	defer c.emitMu.Unlock()
 
-	// Emetto lo snapshot in un'unica chiamata
 	if err := c.metricsConsumer.ConsumeMetrics(ctx, md); err != nil {
 		if c.logger != nil {
 			c.logger.Error("Failed to emit histogram snapshot", zap.Error(err))
 		}
-	} else {
-		if c.logger != nil {
-			c.logger.Debug("DEBUG_LOGS: emitHistSnapshot emitted histogram snapshot",
-				zap.Int("series", len(local)))
-		}
+	} else if c.logger != nil {
+		c.logger.Debug("DEBUG_LOGS: emitHistSnapshot emitted histogram snapshot",
+			zap.Int("series", len(keys)),
+			zap.Strings("services", keys),
+		)
 	}
 }
 
