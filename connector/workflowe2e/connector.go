@@ -340,6 +340,16 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 // e lo invia al consumer (una volta per snapshot).
 // NON imposta timestamp espliciti sui datapoint (lascia che l'exporter / Prometheus handle lo scrape time).
 func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
+
+	// Costruisco il Metrics payload
+	md := pmetric.NewMetrics()
+	rm := md.ResourceMetrics().AppendEmpty()
+
+	rm.Resource().Attributes().PutStr("service.name", "otelcol-workflowe2e") // DA MODIFICARE, A SECONDA DI UsingIstio
+
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName("workflowe2e-connector")
+
 	// Primo: copia i riferimenti agli histogram sotto lock per evitare holding prolungati della map
 	c.histMu.RLock()
 	if len(c.histState) == 0 {
@@ -353,11 +363,6 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		local[k] = v
 	}
 	c.histMu.RUnlock()
-
-	// Costruisco il Metrics payload
-	md := pmetric.NewMetrics()
-	rm := md.ResourceMetrics().AppendEmpty()
-	sm := rm.ScopeMetrics().AppendEmpty()
 
 	// Per ogni histogram copia in locale lo stato (count,sum,buckets) sotto hs.mu
 	for key, hs := range local {
@@ -393,14 +398,16 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		m.SetUnit("s")
 
 		h := m.SetEmptyHistogram()
+		h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative) // Dichiaro esplicitamente che è cumulativo
 		dp := h.DataPoints().AppendEmpty()
 		dp.SetStartTimestamp(startTs)                             // Settiamo lo StartTimestamp in modo che il prometheus-exporter possa esporre la serie come cumulativa
-		dp.SetTimestamp(pcommon.Timestamp(time.Now().UnixNano())) // Aggiungi questa riga per forzare Prometheus a vedere un "nuovo" datapoint
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Now())) // Aggiungi questa riga per forzare Prometheus a vedere un "nuovo" datapoint
 		dp.ExplicitBounds().FromRaw(defaultBounds)
 		dp.SetCount(count)
 		dp.SetSum(float64(sumNs) / 1e9) // somma in secondi
 		dp.BucketCounts().FromRaw(bucketsCopy)
 		dp.Attributes().PutStr("service_name", attrsSvc)
+		dp.Attributes().PutInt("debug_tick", time.Now().Unix())
 	}
 
 	// Emetto lo snapshot in un'unica chiamata
