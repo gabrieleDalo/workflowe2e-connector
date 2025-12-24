@@ -37,7 +37,7 @@ func TestConnectorWorkflowE2ELatencyGauge(t *testing.T) {
 	cfg := &Config{
 		E2ELatencyMetricName:     "workflow_e2e_latency",
 		ServiceLatencyMetricName: "workflow_service_latency",
-		ServiceLatencyMode:       "none",
+		ServiceLatencyMode:       false,
 		ServiceNameAttribute:     "service.name",
 		EnableHistogram:          false, // gauge
 		UsingIstio:               false, // solo OTel
@@ -115,7 +115,7 @@ func TestConnectorWorkflowE2ELatencyHistogramCumulative(t *testing.T) {
 	cfg := &Config{
 		E2ELatencyMetricName:     "workflow_e2e_latency_ms",
 		ServiceLatencyMetricName: "workflow_service_latency_ms",
-		ServiceLatencyMode:       "none",
+		ServiceLatencyMode:       false,
 		ServiceNameAttribute:     "service.name",
 		EnableHistogram:          true,
 		UsingIstio:               false,

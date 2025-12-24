@@ -28,8 +28,7 @@ func createDefaultConfig() component.Config {
 	return &Config{
 		E2ELatencyMetricName:     "workflow_e2e_latency",
 		ServiceLatencyMetricName: "workflow_service_latency",
-		ServiceLatencyMode:       "none", // default solo latenza E2E
-		ServiceAllowList:         nil,
+		ServiceLatencyMode:       false,          // default solo latenza E2E
 		ServiceNameAttribute:     "service.name", // default per OTel spans
 		EnableHistogram:          true,
 		UsingIstio:               false,            // default: solo per OTel

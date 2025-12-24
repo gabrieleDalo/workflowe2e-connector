@@ -23,21 +23,12 @@ type Config struct {
 	// che espone la latenza per singolo servizio (in millisecondi).
 	ServiceLatencyMetricName string `mapstructure:"service_latency_metric_name"`
 
-	// ServiceLatencyMode controlla se e come vengono calcolate
-	// le latenze per singolo microservizio.
-	//
-	// Valori ammessi:
-	// - "none": nessuna metrica per microservizio
-	// - "all": metriche per tutti i microservizi
-	// - "list": solo per i servizi in ServiceAllowList
-	ServiceLatencyMode string `mapstructure:"service_latency_mode"`
-
-	// ServiceAllowList è la lista dei nomi dei microservizi
-	// per cui calcolare le latenze quando ServiceLatencyMode = "list".
-	ServiceAllowList []string `mapstructure:"service_allow_list"`
+	// ServiceLatencyMode va messa a true se è richiesto di calcolare ed esporre anche le latenze
+	// per i singoli microservizi
+	ServiceLatencyMode bool `mapstructure:"service_latency_mode"`
 
 	// ServiceNameAttribute è l'attributo (span o resource)
-	// che identifica il nome del microservizio.
+	// che identifica il nome del microservizio (per distinguerli).
 	// Es.: "service.name"
 	ServiceNameAttribute string `mapstructure:"service_name_attribute"`
 
@@ -68,25 +59,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("e2e_latency_metric_name must not be empty")
 	}
 
-	if c.ServiceLatencyMode != "none" && c.ServiceLatencyMetricName == "" {
+	if c.ServiceLatencyMode && c.ServiceLatencyMetricName == "" {
 		return fmt.Errorf("service_latency_metric_name must not be empty when service_latency_mode != none")
 	}
 
-	// Service latency
-	switch c.ServiceLatencyMode {
-	case "none", "all", "list":
-		// ok
-	default:
-		return fmt.Errorf("service_latency_mode must be one of: none, all, list (got %q)", c.ServiceLatencyMode)
-	}
-
-	if c.ServiceLatencyMode == "list" && len(c.ServiceAllowList) == 0 {
-		return fmt.Errorf(
-			"service_allow_list must be set when service_latency_mode = list",
-		)
-	}
-
-	if c.ServiceLatencyMode != "none" && c.ServiceNameAttribute == "" {
+	if c.ServiceLatencyMode && c.ServiceNameAttribute == "" {
 		return fmt.Errorf("service_name_attribute must not be empty")
 	}
 

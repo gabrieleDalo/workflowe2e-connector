@@ -125,6 +125,51 @@ func keys(m map[string]struct{}) []string {
 	return out
 }
 
+// Funzione "smart discovery" per il nome del servizio
+func (c *connectorImp) getServiceName(span ptrace.Span, resource pcommon.Resource) string {
+	// Se l'utente ha configurato un attributo specifico, viene usato come priorità assoluta
+	if c.cfg.ServiceNameAttribute != "" {
+		// Prima controllo se è negli attributi degli span (tipico di Istio)
+		if v, ok := span.Attributes().Get(c.cfg.ServiceNameAttribute); ok {
+			return v.AsString()
+		}
+		// Poi controllo se è negli attributi delle resource (tipico di OTel)
+		if v, ok := resource.Attributes().Get(c.cfg.ServiceNameAttribute); ok {
+			return v.AsString()
+		}
+	}
+
+	if c.cfg.UsingIstio {
+		// Fallback su convenzioni standard (per Istio e OTel)
+		// Cerchiamo nello span (tipico di Istio/Sidecar)
+		spanKeys := []string{"istio.canonical_service", "peer.service"}
+
+		for _, k := range spanKeys {
+			if v, ok := span.Attributes().Get(k); ok && v.AsString() != "" {
+				return v.AsString()
+			}
+		}
+	} else {
+		// Cerchiamo nella risorsa (tipico di SDK OTel)
+		if v, ok := resource.Attributes().Get("service.name"); ok && v.AsString() != "" {
+			return v.AsString()
+		}
+	}
+
+	// Se non trova nulla
+	return "unknown"
+}
+
+func (c *connectorImp) isIstioSidecar(span ptrace.Span) bool {
+	// Oppure controlla il component
+	if v, ok := span.Attributes().Get("component"); ok && v.AsString() == "proxy" {
+		return true
+	}
+	// Oppure, Istio mette quasi sempre "istio.canonical_service"
+	_, hasCanonical := span.Attributes().Get("istio.canonical_service")
+	return hasCanonical
+}
+
 // Funzione che aggiorna o crea lo stato per una trace_id quando riceve uno span
 func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string) {
 	// Recupera o crea traceState
@@ -152,10 +197,9 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 			ts.maxEnd = end
 		}
 		// Aggiunge l'intervallo per il servizio (solo se abbiamo end)
-		if svc == "" {
-			svc = "unknown"
+		if svc != "" {
+			ts.serviceIntervals[svc] = append(ts.serviceIntervals[svc], interval{start: start, end: end})
 		}
-		ts.serviceIntervals[svc] = append(ts.serviceIntervals[svc], interval{start: start, end: end})
 	}
 	// Aggiorna lastSeen sempre (anche per span aperti)
 	ts.lastSeen = time.Now()
@@ -314,7 +358,7 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	c.updateHistogram(e2eKey, latencyNs, defaultBounds)
 
 	// Se richiesto, Faccio il merge degli intervalli per i singoli servizi e aggiorno l'istogramma (stato in memoria)
-	if c.cfg.ServiceLatencyMode != "none" {
+	if c.cfg.ServiceLatencyMode {
 		for svc, ivs := range serviceIntervals {
 			activeNs := mergeIntervals(ivs)
 			if activeNs == 0 {
@@ -345,7 +389,13 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 	md := pmetric.NewMetrics()
 	rm := md.ResourceMetrics().AppendEmpty()
 
-	rm.Resource().Attributes().PutStr("service.name", "otelcol-workflowe2e") // DA MODIFICARE, A SECONDA DI UsingIstio
+	attrs := rm.Resource().Attributes()
+	if c.cfg.UsingIstio {
+		// Se usi Istio, marchiamo la metrica come prodotta dal monitoraggio mesh
+		attrs.PutStr("service.name", "istio-workflow-monitor")
+	} else {
+		attrs.PutStr("service.name", "otel-workflow-monitor")
+	}
 
 	sm := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().SetName("workflowe2e-connector")
@@ -357,7 +407,7 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		// niente da emettere
 		return
 	}
-	// copia shallow delle chiavi e dei puntatori
+	// Copia superficiale delle chiavi e dei puntatori
 	local := make(map[string]*histogramState, len(c.histState))
 	for k, v := range c.histState {
 		local[k] = v
@@ -398,16 +448,16 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		m.SetUnit("s")
 
 		h := m.SetEmptyHistogram()
-		h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative) // Dichiaro esplicitamente che è cumulativo
+		h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative) // Dichiaro esplicitamente che l'istogramma è cumulativo
+
 		dp := h.DataPoints().AppendEmpty()
 		dp.SetStartTimestamp(startTs)                             // Settiamo lo StartTimestamp in modo che il prometheus-exporter possa esporre la serie come cumulativa
-		dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Now())) // Aggiungi questa riga per forzare Prometheus a vedere un "nuovo" datapoint
+		dp.SetTimestamp(pcommon.NewTimestampFromTime(time.Now())) // Prometheus vede un "nuovo" datapoint poichè il timestamp cambia e quindi aggiorna la metrica
 		dp.ExplicitBounds().FromRaw(defaultBounds)
 		dp.SetCount(count)
 		dp.SetSum(float64(sumNs) / 1e9) // somma in secondi
 		dp.BucketCounts().FromRaw(bucketsCopy)
-		dp.Attributes().PutStr("service_name", attrsSvc)
-		//dp.Attributes().PutInt("debug_tick", time.Now().Unix()) // Con questo funziona correttamente ma vengono create esponenzialmente metriche nuove poichè cambia la label tick
+		dp.Attributes().PutStr("generated_from_service", attrsSvc)
 	}
 
 	// Emetto lo snapshot in un'unica chiamata
@@ -432,23 +482,14 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 
 	// Come prima cosa raccolgo info per ogni trace presente nel batch
 	traceIDs := make(map[string]struct{})
-	//preExisting := make(map[string]bool)   // Usata per sapere se una trace era già esistente nello stato prima di questo batch
-	//batchAllEnded := make(map[string]bool) // Usata per sapere se tutte le span del batch per una trace sono terminate (hanno endTime != 0)
 
-	// Segno quali traces esistono già (hanno già uno stato)
-	//c.tracesMu.Lock()
-	//for tid := range c.traces {
-	//	preExisting[tid] = true
-	//}
-	//c.tracesMu.Unlock()
-
-	// Aggiorno lo stato per ogni span e raccolgo se nel batch
+	// Aggiorno lo stato, per ogni span
 	for i := 0; i < td.ResourceSpans().Len(); i++ {
 		rs := td.ResourceSpans().At(i)
 		for j := 0; j < rs.ScopeSpans().Len(); j++ {
 			ss := rs.ScopeSpans().At(j)
 			spans := ss.Spans()
-			for k := 0; k < spans.Len(); k++ {
+			for k := 0; k < spans.Len(); k++ { // Ciclo sugli spans delle trace
 				span := spans.At(k)
 				tid := span.TraceID().String() // Controllo i trace_id dagli spans, per capire quali traces diverse sono arrivate insieme
 				traceIDs[tid] = struct{}{}
@@ -456,25 +497,24 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 				start := span.StartTimestamp()
 				end := span.EndTimestamp()
 
-				// determina il nome del servizio (stessa logica del calcolo successivo)
-				var svc string
-				// prefer span attribute (istio mode) altrimenti resource attr
-				if c.cfg.UsingIstio {
-					if v, ok := span.Attributes().Get(c.cfg.ServiceNameAttribute); ok {
-						svc = v.AsString()
+				if c.cfg.ServiceLatencyMode {
+					// Determina il nome del servizio (controllando vari attributi a seconda se stiamo usando Istio o meno)
+					svcName := c.getServiceName(span, rs.Resource())
+
+					// Qui verifichiamo se lo span è quello giusto per il calcolo richiesto
+					isIstioSpan := c.isIstioSidecar(span)
+
+					// Se UsingIstio è true, consideriamo solo gli span di Istio
+					// Se è false, consideriamo solo quelli applicativi (non-Istio)
+					if (c.cfg.UsingIstio && isIstioSpan) || (!c.cfg.UsingIstio && !isIstioSpan) {
+						// Aggiorna lo stato temporale specifico per QUESTO servizio dentro la traccia
+						c.updateTraceStateForSpan(tid, start, end, svcName)
 					}
-				}
-				if svc == "" {
-					if v, ok := rs.Resource().Attributes().Get(c.cfg.ServiceNameAttribute); ok {
-						svc = v.AsString()
-					}
-				}
-				if svc == "" {
-					svc = "unknown"
+				} else {
+					// Aggiorno lo stato per la trace
+					c.updateTraceStateForSpan(tid, start, end, "")
 				}
 
-				// Aggiorno lo stato per la trace
-				c.updateTraceStateForSpan(tid, start, end, svc)
 			}
 		}
 	}
@@ -483,9 +523,6 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 		zap.Int("unique_trace_count", len(traceIDs)),
 		zap.Any("trace_ids", keys(traceIDs)),
 	)
-
-	// NOTE: qui NON emetto metriche per traces parziali; il flusher in Start() si occuperà di
-	// finalizzare eventuali traces che restano inert per traceIdleTimeout.
 
 	return nil
 }
@@ -538,8 +575,10 @@ func (c *connectorImp) Start(ctx context.Context, host component.Host) error {
 					c.finalizeTrace(tid)
 				}
 
-				// Dopo avere finalizzato traces inattive, emetto uno snapshot coerente degli histogram cumulativi
+				// Dopo avere finalizzato traces inattive, emetto lo stato degli histogram cumulativi
+				// Devo emetterlo continuamente in modo che Prometheus possa fare lo scrape
 				c.emitHistSnapshot(context.Background())
+
 			// Quando il Collector chiama Shutdown (o il contesto viene cancellato), la goroutine esce in modo pulito
 			case <-ctx.Done():
 				return
@@ -563,7 +602,8 @@ func (c *connectorImp) Shutdown(ctx context.Context) error {
 	for _, tid := range all {
 		c.finalizeTrace(tid)
 	}
-	// Emitto uno snapshot finale
+
+	// Emetto uno snapshot finale
 	c.emitHistSnapshot(context.Background())
 	return nil
 }
