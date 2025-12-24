@@ -497,6 +497,8 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 				start := span.StartTimestamp()
 				end := span.EndTimestamp()
 
+				svcToUpdate := ""
+
 				if c.cfg.ServiceLatencyMode {
 					// Determina il nome del servizio (controllando vari attributi a seconda se stiamo usando Istio o meno)
 					svcName := c.getServiceName(span, rs.Resource())
@@ -508,13 +510,12 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 					// Se è false, consideriamo solo quelli applicativi (non-Istio)
 					if (c.cfg.UsingIstio && isIstioSpan) || (!c.cfg.UsingIstio && !isIstioSpan) {
 						// Aggiorna lo stato temporale specifico per QUESTO servizio dentro la traccia
-						c.updateTraceStateForSpan(tid, start, end, svcName)
+						svcToUpdate = svcName
 					}
-				} else {
-					// Aggiorno lo stato per la trace
-					c.updateTraceStateForSpan(tid, start, end, "")
 				}
 
+				// Aggiorno lo stato per la trace
+				c.updateTraceStateForSpan(tid, start, end, svcToUpdate)
 			}
 		}
 	}

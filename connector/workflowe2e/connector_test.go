@@ -39,7 +39,6 @@ func TestConnectorWorkflowE2ELatencyGauge(t *testing.T) {
 		ServiceLatencyMetricName: "workflow_service_latency",
 		ServiceLatencyMode:       false,
 		ServiceNameAttribute:     "service.name",
-		EnableHistogram:          false, // gauge
 		UsingIstio:               false, // solo OTel
 	}
 
@@ -117,7 +116,6 @@ func TestConnectorWorkflowE2ELatencyHistogramCumulative(t *testing.T) {
 		ServiceLatencyMetricName: "workflow_service_latency_ms",
 		ServiceLatencyMode:       false,
 		ServiceNameAttribute:     "service.name",
-		EnableHistogram:          true,
 		UsingIstio:               false,
 	}
 

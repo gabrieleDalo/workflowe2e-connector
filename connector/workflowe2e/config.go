@@ -32,9 +32,6 @@ type Config struct {
 	// Es.: "service.name"
 	ServiceNameAttribute string `mapstructure:"service_name_attribute"`
 
-	// EnableHistogram se true userà histogram (consigliato), altrimenti gauge.
-	EnableHistogram bool `mapstructure:"enable_histogram"`
-
 	// Se true, significa che sta usando sia OTel che Istio per generare spans, altrimenti solo OTel
 	UsingIstio bool `mapstructure:"using_istio"`
 
