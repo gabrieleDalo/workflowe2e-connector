@@ -485,7 +485,13 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		dp.Attributes().PutStr("generated_from_service", svcLabel)
 
 		if deploymentLabel != "" {
-			dp.Attributes().PutStr("k8s.deployment.name", deploymentLabel)
+			dp.Attributes().PutStr("service_deployment", deploymentLabel)
+		}
+
+		if c.logger != nil {
+			c.logger.Debug("DEBUG_LOGS: Deployment",
+				zap.String("service_deployment", deploymentLabel),
+			)
 		}
 	}
 
