@@ -487,12 +487,6 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		if deploymentLabel != "" {
 			dp.Attributes().PutStr("service_deployment", deploymentLabel)
 		}
-
-		if c.logger != nil {
-			c.logger.Debug("DEBUG_LOGS: Deployment",
-				zap.String("service_deployment", deploymentLabel),
-			)
-		}
 	}
 
 	// Emetto lo snapshot in un'unica chiamata
@@ -554,6 +548,14 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 						serviceDeployment = v.AsString()
 					} else if v, ok := span.Attributes().Get("k8s.deployment.name"); ok {
 						serviceDeployment = v.AsString()
+					} else {
+						serviceDeployment = "none"
+					}
+
+					if c.logger != nil {
+						c.logger.Debug("DEBUG_LOGS: Deployment",
+							zap.String("service_deployment", serviceDeployment),
+						)
 					}
 				}
 
