@@ -45,13 +45,14 @@ type interval struct {
 // non è assicurato che tutti gli spans di una traccia arrivino insieme
 // NB: lo stato è in memoria del processo. Se il collector si riavvia lo stato viene perso
 type traceState struct {
-	mu               sync.Mutex
-	minStart         pcommon.Timestamp
-	maxEnd           pcommon.Timestamp
-	lastSeen         time.Time
-	spanCount        int
-	serviceIntervals map[string][]interval // per-service lista di intervalli non ancora mergiati
-	emitted          bool                  // Indica se abbiamo già emesso la metrica per questa trace (evita doppie emissioni)
+	mu                 sync.Mutex
+	minStart           pcommon.Timestamp
+	maxEnd             pcommon.Timestamp
+	lastSeen           time.Time
+	spanCount          int
+	serviceIntervals   map[string][]interval          // per-service, lista di intervalli non ancora mergiati
+	serviceDeployments map[string]map[string]struct{} // per-service, insieme di deployment del servizio
+	emitted            bool                           // Indica se abbiamo già emesso la metrica per questa trace (evita doppie emissioni)
 }
 
 // connectorImp implementa connector.Traces quindi, dobbiamo implementare:
@@ -177,10 +178,11 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 	ts := c.traces[traceID]
 	if ts == nil {
 		ts = &traceState{
-			minStart:         maxTimestamp,
-			maxEnd:           0,
-			lastSeen:         time.Now(),
-			serviceIntervals: make(map[string][]interval),
+			minStart:           maxTimestamp,
+			maxEnd:             0,
+			lastSeen:           time.Now(),
+			serviceIntervals:   make(map[string][]interval),
+			serviceDeployments: make(map[string]map[string]struct{}),
 		}
 		c.traces[traceID] = ts
 	}
@@ -198,11 +200,15 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 		}
 		// Aggiunge l'intervallo per il servizio (solo se abbiamo end)
 		if svc != "" {
-			key := svc
+			ts.serviceIntervals[svc] = append(ts.serviceIntervals[svc], interval{start: start, end: end})
+
+			// Se abbiamo il deployment, aggiungiamolo al set per questo servizio
 			if deployment != "" {
-				key = svc + "|" + deployment // composizione chiave
+				if _, ok := ts.serviceDeployments[svc]; !ok {
+					ts.serviceDeployments[svc] = make(map[string]struct{})
+				}
+				ts.serviceDeployments[svc][deployment] = struct{}{}
 			}
-			ts.serviceIntervals[key] = append(ts.serviceIntervals[key], interval{start: start, end: end})
 		}
 	}
 	// Aggiorna lastSeen sempre (anche per span aperti)
@@ -336,7 +342,21 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	// Salvo i valori da utilizzare per calcolare la latenza e la segno come emessa (per evitare che qualcun altro lo faccia)
 	minStart := ts.minStart
 	maxEnd := ts.maxEnd
-	serviceIntervals := ts.serviceIntervals
+
+	// Copia superficiale delle mappe sotto lock per usarle una volta rilasciato il lock
+	serviceIntervals := make(map[string][]interval, len(ts.serviceIntervals))
+	for k, v := range ts.serviceIntervals {
+		serviceIntervals[k] = append([]interval(nil), v...)
+	}
+
+	// Copia del set di deployment per servizio (lo trasformiamo in slice per semplicità d'uso)
+	serviceDeployments := make(map[string][]string, len(ts.serviceDeployments))
+	for svc, depSet := range ts.serviceDeployments {
+		for d := range depSet {
+			serviceDeployments[svc] = append(serviceDeployments[svc], d)
+		}
+	}
+
 	ts.emitted = true
 	ts.mu.Unlock()
 
@@ -363,25 +383,26 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 
 	// Se richiesto, Faccio il merge degli intervalli per i singoli servizi e aggiorno l'istogramma (stato in memoria)
 	if c.cfg.ServiceLatencyMode {
-		for key, ivs := range serviceIntervals {
+		for svc, ivs := range serviceIntervals {
 			activeNs := mergeIntervals(ivs)
 			if activeNs == 0 {
 				continue
 			}
 
-			svc := key
-			deployment := ""
-			if parts := strings.SplitN(key, "|", 2); len(parts) == 2 {
-				svc = parts[0]
-				deployment = parts[1]
+			deps := serviceDeployments[svc]
+
+			// Se non abbiamo deployment, emetti una serie senza deployment
+			if len(deps) == 0 {
+				histKey := "service:" + svc
+				c.updateHistogram(histKey, activeNs, defaultBounds)
+				continue
 			}
 
-			histKey := "service:" + svc
-			if deployment != "" {
-				histKey = histKey + "|deployment:" + deployment
+			// Se abbiamo 1 o più deployment, emetti una serie separata per ciascuno.
+			for _, d := range deps {
+				histKey := "service:" + svc + "|deployment:" + d
+				c.updateHistogram(histKey, activeNs, defaultBounds)
 			}
-
-			c.updateHistogram(histKey, activeNs, defaultBounds)
 		}
 	}
 
@@ -455,11 +476,12 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 
 		svcLabel := attrsSvc
 		deploymentLabel := ""
-
-		if strings.Contains(key, "|deployment:") {
-			parts := strings.SplitN(key, "|deployment:", 2)
-			svcLabel = strings.TrimPrefix(parts[0], "service:")
-			deploymentLabel = parts[1]
+		if !strings.HasPrefix(attrsSvc, "__e2e__") {
+			if strings.Contains(attrsSvc, "|deployment:") {
+				parts := strings.SplitN(attrsSvc, "|deployment:", 2)
+				svcLabel = parts[0]
+				deploymentLabel = parts[1]
+			}
 		}
 
 		// Appendo la metrica (histogram) al payload
@@ -543,19 +565,11 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 						svcToUpdate = svcName
 					}
 
-					// Controlliamo prima resource attribute (più stabile), altrimenti fallback allo span attribute
+					// Estraggo il nome del deployment del servizio, prova prima la resource poi lo span
 					if v, ok := rs.Resource().Attributes().Get("k8s.deployment.name"); ok {
 						serviceDeployment = v.AsString()
 					} else if v, ok := span.Attributes().Get("k8s.deployment.name"); ok {
 						serviceDeployment = v.AsString()
-					} else {
-						serviceDeployment = "none"
-					}
-
-					if c.logger != nil {
-						c.logger.Debug("DEBUG_LOGS: Deployment",
-							zap.String("service_deployment", serviceDeployment),
-						)
 					}
 				}
 
