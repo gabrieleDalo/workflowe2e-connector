@@ -171,7 +171,7 @@ func (c *connectorImp) isIstioSidecar(span ptrace.Span) bool {
 }
 
 // Funzione che aggiorna o crea lo stato per una trace_id quando riceve uno span
-func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string) {
+func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deployment string) {
 	// Recupera o crea traceState
 	c.tracesMu.Lock()
 	ts := c.traces[traceID]
@@ -198,7 +198,11 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 		}
 		// Aggiunge l'intervallo per il servizio (solo se abbiamo end)
 		if svc != "" {
-			ts.serviceIntervals[svc] = append(ts.serviceIntervals[svc], interval{start: start, end: end})
+			key := svc
+			if deployment != "" {
+				key = svc + "|" + deployment // composizione chiave
+			}
+			ts.serviceIntervals[svc] = append(ts.serviceIntervals[key], interval{start: start, end: end})
 		}
 	}
 	// Aggiorna lastSeen sempre (anche per span aperti)
@@ -359,13 +363,25 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 
 	// Se richiesto, Faccio il merge degli intervalli per i singoli servizi e aggiorno l'istogramma (stato in memoria)
 	if c.cfg.ServiceLatencyMode {
-		for svc, ivs := range serviceIntervals {
+		for key, ivs := range serviceIntervals {
 			activeNs := mergeIntervals(ivs)
 			if activeNs == 0 {
 				continue
 			}
-			key := "service:" + svc
-			c.updateHistogram(key, activeNs, defaultBounds)
+
+			svc := key
+			deployment := ""
+			if parts := strings.SplitN(key, "|", 2); len(parts) == 2 {
+				svc = parts[0]
+				deployment = parts[1]
+			}
+
+			histKey := "service:" + svc
+			if deployment != "" {
+				histKey = histKey + "|deployment:" + deployment
+			}
+
+			c.updateHistogram(histKey, activeNs, defaultBounds)
 		}
 	}
 
@@ -437,6 +453,15 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 			attrsSvc = key
 		}
 
+		svcLabel := attrsSvc
+		deploymentLabel := ""
+
+		if strings.Contains(key, "|deployment:") {
+			parts := strings.SplitN(key, "|deployment:", 2)
+			svcLabel = strings.TrimPrefix(parts[0], "service:")
+			deploymentLabel = parts[1]
+		}
+
 		// Appendo la metrica (histogram) al payload
 		m := sm.Metrics().AppendEmpty()
 		m.SetName(metricName)
@@ -457,7 +482,11 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		dp.SetCount(count)
 		dp.SetSum(float64(sumNs) / 1e9) // somma in secondi
 		dp.BucketCounts().FromRaw(bucketsCopy)
-		dp.Attributes().PutStr("generated_from_service", attrsSvc)
+		dp.Attributes().PutStr("generated_from_service", svcLabel)
+
+		if deploymentLabel != "" {
+			dp.Attributes().PutStr("k8s.deployment.name", deploymentLabel)
+		}
 	}
 
 	// Emetto lo snapshot in un'unica chiamata
@@ -498,6 +527,7 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 				end := span.EndTimestamp()
 
 				svcToUpdate := ""
+				serviceDeployment := ""
 
 				if c.cfg.ServiceLatencyMode {
 					// Determina il nome del servizio (controllando vari attributi a seconda se stiamo usando Istio o meno)
@@ -512,10 +542,17 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 						// Aggiorna lo stato temporale specifico per QUESTO servizio dentro la traccia
 						svcToUpdate = svcName
 					}
+
+					// Controlliamo prima resource attribute (più stabile), altrimenti fallback allo span attribute
+					if v, ok := rs.Resource().Attributes().Get("k8s.deployment.name"); ok {
+						serviceDeployment = v.AsString()
+					} else if v, ok := span.Attributes().Get("k8s.deployment.name"); ok {
+						serviceDeployment = v.AsString()
+					}
 				}
 
 				// Aggiorno lo stato per la trace
-				c.updateTraceStateForSpan(tid, start, end, svcToUpdate)
+				c.updateTraceStateForSpan(tid, start, end, svcToUpdate, serviceDeployment)
 			}
 		}
 	}
