@@ -202,7 +202,7 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 			if deployment != "" {
 				key = svc + "|" + deployment // composizione chiave
 			}
-			ts.serviceIntervals[svc] = append(ts.serviceIntervals[key], interval{start: start, end: end})
+			ts.serviceIntervals[key] = append(ts.serviceIntervals[key], interval{start: start, end: end})
 		}
 	}
 	// Aggiorna lastSeen sempre (anche per span aperti)
