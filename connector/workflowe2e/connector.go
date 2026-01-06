@@ -51,6 +51,7 @@ type traceState struct {
 	lastSeen         time.Time
 	spanCount        int
 	serviceIntervals map[string][]interval // per-service lista di intervalli non ancora mergiati
+	serviceToDeploy  map[string]string     // Associa un servizio al corrispettivo Deployment (l'ultimo trovato in caso un servizio sia associato a più deployment)
 	emitted          bool                  // Indica se abbiamo già emesso la metrica per questa trace (evita doppie emissioni)
 }
 
@@ -160,6 +161,26 @@ func (c *connectorImp) getServiceName(span ptrace.Span, resource pcommon.Resourc
 	return "unknown"
 }
 
+// Funzione helper per estrarre il nome del deployment
+func (c *connectorImp) getDeploymentName(span ptrace.Span, resource pcommon.Resource) string {
+	// Cerca negli attributi della risorsa (standard OTel)
+	if v, ok := resource.Attributes().Get("k8s.deployment.name"); ok && v.AsString() != "" {
+		return v.AsString()
+	}
+	// Altrimenti cerca negli attributi dello span
+	if v, ok := span.Attributes().Get("k8s.deployment.name"); ok && v.AsString() != "" {
+		return v.AsString()
+	}
+	// Altri possibili nomi attributo
+	keys := []string{"deployment.name", "k8s.workload.name"}
+	for _, k := range keys {
+		if v, ok := resource.Attributes().Get(k); ok && v.AsString() != "" {
+			return v.AsString()
+		}
+	}
+	return "unknown"
+}
+
 func (c *connectorImp) isIstioSidecar(span ptrace.Span) bool {
 	// Oppure controlla il component
 	if v, ok := span.Attributes().Get("component"); ok && v.AsString() == "proxy" {
@@ -171,7 +192,7 @@ func (c *connectorImp) isIstioSidecar(span ptrace.Span) bool {
 }
 
 // Funzione che aggiorna o crea lo stato per una trace_id quando riceve uno span
-func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string) {
+func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deploy string) {
 	// Recupera o crea traceState
 	c.tracesMu.Lock()
 	ts := c.traces[traceID]
@@ -181,6 +202,7 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 			maxEnd:           0,
 			lastSeen:         time.Now(),
 			serviceIntervals: make(map[string][]interval),
+			serviceToDeploy:  make(map[string]string),
 		}
 		c.traces[traceID] = ts
 	}
@@ -199,6 +221,12 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 		// Aggiunge l'intervallo per il servizio (solo se abbiamo end)
 		if svc != "" {
 			ts.serviceIntervals[svc] = append(ts.serviceIntervals[svc], interval{start: start, end: end})
+
+			// Salviamo anche il deployment del servizio, se lo troviamo
+			// Se abbiamo già un nome (es. da uno span OTel), non lo sovrascriviamo con "unknown" (es. da uno span Istio)
+			if deploy != "unknown" || ts.serviceToDeploy[svc] == "" {
+				ts.serviceToDeploy[svc] = deploy
+			}
 		}
 	}
 	// Aggiorna lastSeen sempre (anche per span aperti)
@@ -333,6 +361,7 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	minStart := ts.minStart
 	maxEnd := ts.maxEnd
 	serviceIntervals := ts.serviceIntervals
+	serviceToDeploy := ts.serviceToDeploy
 	ts.emitted = true
 	ts.mu.Unlock()
 
@@ -364,7 +393,16 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 			if activeNs == 0 {
 				continue
 			}
-			key := "service:" + svc
+
+			// Recuperiamo il deployment associato a questo servizio nella traccia
+			deploy := serviceToDeploy[svc]
+			if deploy == "" {
+				deploy = "unknown"
+			}
+
+			// Creiamo una chiave composta per l'istogramma globale. Questo permette a Prometheus di avere serie distinte per ogni deployment.
+			// Formato: "service:nome-servizio|nome-deployment"
+			key := "service:" + svc + "|" + deploy
 			c.updateHistogram(key, activeNs, defaultBounds)
 		}
 	}
@@ -426,15 +464,25 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		// Decido che nome di metrica usare
 		var metricName string
 		attrsSvc := ""
+		attrsDeploy := ""
+
 		if key == "__e2e__" {
 			metricName = c.cfg.E2ELatencyMetricName
-			attrsSvc = "__e2e__"
+			attrsSvc = "none"
+			attrsDeploy = "none"
 		} else if strings.HasPrefix(key, "service:") {
 			metricName = c.cfg.ServiceLatencyMetricName
-			attrsSvc = strings.TrimPrefix(key, "service:")
-		} else {
-			metricName = c.cfg.E2ELatencyMetricName
-			attrsSvc = key
+
+			// Rimuoviamo il prefisso e dividiamo servizio e deployment
+			content := strings.TrimPrefix(key, "service:")
+			parts := strings.Split(content, "|")
+
+			attrsSvc = parts[0]
+			if len(parts) > 1 {
+				attrsDeploy = parts[1]
+			} else {
+				attrsDeploy = "unknown"
+			}
 		}
 
 		// Appendo la metrica (histogram) al payload
@@ -458,6 +506,7 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		dp.SetSum(float64(sumNs) / 1e9) // somma in secondi
 		dp.BucketCounts().FromRaw(bucketsCopy)
 		dp.Attributes().PutStr("generated_from_service", attrsSvc)
+		dp.Attributes().PutStr("service_deployment_name", attrsDeploy)
 	}
 
 	// Emetto lo snapshot in un'unica chiamata
@@ -498,10 +547,12 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 				end := span.EndTimestamp()
 
 				svcToUpdate := ""
+				deployName := ""
 
 				if c.cfg.ServiceLatencyMode {
 					// Determina il nome del servizio (controllando vari attributi a seconda se stiamo usando Istio o meno)
 					svcName := c.getServiceName(span, rs.Resource())
+					deployName = c.getDeploymentName(span, rs.Resource())
 
 					// Qui verifichiamo se lo span è quello giusto per il calcolo richiesto
 					isIstioSpan := c.isIstioSidecar(span)
@@ -515,7 +566,7 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 				}
 
 				// Aggiorno lo stato per la trace
-				c.updateTraceStateForSpan(tid, start, end, svcToUpdate)
+				c.updateTraceStateForSpan(tid, start, end, svcToUpdate, deployName)
 			}
 		}
 	}
