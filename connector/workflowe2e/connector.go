@@ -191,8 +191,17 @@ func (c *connectorImp) isIstioSidecar(span ptrace.Span) bool {
 	return hasCanonical
 }
 
+// Funzione che normalizza i nomi dei servizi (ad es. per Istio possono essere <nome servizio>.<nome namespace>)
+func (c *connectorImp) normalizeServiceName(name string) string {
+	if name == "unknown" {
+		return name
+	}
+	// Se il nome è "s-0.default", prendiamo solo "s-0"
+	return strings.Split(name, ".")[0]
+}
+
 // Funzione che aggiorna o crea lo stato per una trace_id quando riceve uno span
-func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deploy string) {
+func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deploy string, useForTiming bool) {
 	// Recupera o crea traceState
 	c.tracesMu.Lock()
 	ts := c.traces[traceID]
@@ -219,13 +228,18 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 			ts.maxEnd = end
 		}
 		// Aggiunge l'intervallo per il servizio (solo se abbiamo end)
-		if svc != "" {
-			ts.serviceIntervals[svc] = append(ts.serviceIntervals[svc], interval{start: start, end: end})
+		if svc != "" && svc != "unknown" {
+			if useForTiming {
+				ts.serviceIntervals[svc] = append(ts.serviceIntervals[svc], interval{start: start, end: end})
+			}
 
 			// Salviamo anche il deployment del servizio, se lo troviamo
 			// Se abbiamo già un nome (es. da uno span OTel), non lo sovrascriviamo con "unknown" (es. da uno span Istio)
-			if deploy != "unknown" || ts.serviceToDeploy[svc] == "" {
+			if deploy != "unknown" {
 				ts.serviceToDeploy[svc] = deploy
+			} else if _, exists := ts.serviceToDeploy[svc]; !exists {
+				// Inizializziamo a unknown solo se non abbiamo proprio nulla
+				ts.serviceToDeploy[svc] = "unknown"
 			}
 		}
 	}
@@ -548,10 +562,12 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 
 				svcToUpdate := ""
 				deployName := ""
+				useForTiming := false
 
 				if c.cfg.ServiceLatencyMode {
 					// Determina il nome del servizio (controllando vari attributi a seconda se stiamo usando Istio o meno)
-					svcName := c.getServiceName(span, rs.Resource())
+					rawSvcName := c.getServiceName(span, rs.Resource())
+					svcToUpdate = c.normalizeServiceName(rawSvcName)
 					deployName = c.getDeploymentName(span, rs.Resource())
 
 					// Qui verifichiamo se lo span è quello giusto per il calcolo richiesto
@@ -559,14 +575,11 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 
 					// Se UsingIstio è true, consideriamo solo gli span di Istio
 					// Se è false, consideriamo solo quelli applicativi (non-Istio)
-					if (c.cfg.UsingIstio && isIstioSpan) || (!c.cfg.UsingIstio && !isIstioSpan) {
-						// Aggiorna lo stato temporale specifico per QUESTO servizio dentro la traccia
-						svcToUpdate = svcName
-					}
+					useForTiming = (c.cfg.UsingIstio && isIstioSpan) || (!c.cfg.UsingIstio && !isIstioSpan)
 				}
 
 				// Aggiorno lo stato per la trace
-				c.updateTraceStateForSpan(tid, start, end, svcToUpdate, deployName)
+				c.updateTraceStateForSpan(tid, start, end, svcToUpdate, deployName, useForTiming)
 			}
 		}
 	}
