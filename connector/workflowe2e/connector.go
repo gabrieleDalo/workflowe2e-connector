@@ -3,6 +3,7 @@ package workflowe2e
 import (
 	"context"
 	"errors"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -32,6 +33,14 @@ type histogramState struct {
 	start   pcommon.Timestamp // start timestamp della serie cumulativa (impostato alla creazione)
 }
 
+// Chiave composta per identificare un istogramma
+type histKey struct {
+	rootService   string
+	rootOperation string
+	currentSvc    string // Usato per distinguere E2E (sarà "none") dai singoli servizi
+	currentDeploy string
+}
+
 // Intervallo usato per il merge degli spans di uno stesso servizio
 // Contiene il tempo di inizio e fine per uno span
 // Serve per gestire il caso in cui un servizio esegue, poi si passa ad un altro servizio e poi si torna indietro
@@ -44,14 +53,16 @@ type interval struct {
 // non è assicurato che tutti gli spans di una traccia arrivino insieme
 // NB: lo stato è in memoria del processo. Se il collector si riavvia lo stato viene perso
 type traceState struct {
-	mu               sync.Mutex
-	minStart         pcommon.Timestamp
-	maxEnd           pcommon.Timestamp
-	lastSeen         time.Time
-	spanCount        int
-	serviceIntervals map[string][]interval // Lista per-service di intervalli non ancora mergiati
-	serviceToDeploy  map[string]string     // Associa un servizio al corrispettivo Deployment (l'ultimo trovato in caso un servizio sia associato a più deployment)
-	emitted          bool                  // Indica se abbiamo già emesso la metrica per questa trace (evita doppie emissioni)
+	mu                sync.Mutex
+	minStart          pcommon.Timestamp
+	maxEnd            pcommon.Timestamp
+	lastSeen          time.Time
+	spanCount         int
+	serviceIntervals  map[string][]interval // Lista per-service di intervalli non ancora mergiati
+	serviceToDeploy   map[string]string     // Associa un servizio al corrispettivo Deployment (l'ultimo trovato in caso un servizio sia associato a più deployment)
+	rootServiceName   string                // Il nome del servizio entry-point e l'operazione richieste identificano un workflow
+	rootOperationName string
+	emitted           bool // Indica se abbiamo già emesso la metrica per questa trace (evita doppie emissioni)
 }
 
 // connectorImp implementa connector.Traces quindi, dobbiamo implementare:
@@ -66,7 +77,7 @@ type connectorImp struct {
 	// Stato cumulativo degli histogram
 	// permette di tenere lo stato memorizzato tra più chiamate a ConsumeTraces
 	histMu    sync.RWMutex
-	histState map[string]*histogramState // Ogni combinazione di label è una time series diversa
+	histState map[histKey]*histogramState // Ogni combinazione di label è una time series diversa
 
 	// Stato per trace "incrementali" (se arrivano "spezzate")
 	// permette di tenere lo stato memorizzato tra più chiamate a ConsumeTraces
@@ -98,7 +109,7 @@ func newConnector(
 		metricsConsumer:    metricsConsumer,
 		cfg:                myCfg,
 		logger:             settings.TelemetrySettings.Logger,
-		histState:          make(map[string]*histogramState),
+		histState:          make(map[histKey]*histogramState),
 		traces:             make(map[string]*traceState),
 		traceIdleTimeout:   myCfg.TraceIdleTimeout,
 		traceFlushInterval: myCfg.TraceFlushInterval,
@@ -118,6 +129,25 @@ func keys(m map[string]struct{}) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// Funzione helper per estrarre l'operazione dagli spans di Istio (quelli di OTel hanno già operationName)
+func (c *connectorImp) getCleanOperationName(span ptrace.Span) string {
+	method, hasMethod := span.Attributes().Get("http.method")
+	fullURL, hasURL := span.Attributes().Get("http.url")
+
+	if hasMethod && hasURL {
+		// Usa net/url per estrarre solo il path (es. /startProcess) escludento l'IP
+		if parsed, err := url.Parse(fullURL.AsString()); err == nil && parsed.Path != "" {
+			return method.AsString() + " " + parsed.Path
+		}
+	}
+
+	if span.Name() != "" {
+		return span.Name()
+	}
+
+	return "unknown"
 }
 
 // Funzione di discovery per il nome del servizio
@@ -188,15 +218,15 @@ func (c *connectorImp) isIstioSidecar(span ptrace.Span) bool {
 
 // Funzione che normalizza i nomi dei servizi (ad es. per Istio possono essere <nome servizio>.<nome namespace>)
 func (c *connectorImp) normalizeServiceName(name string) string {
-	if name == "unknown" {
-		return name
+	if name == "" || name == "unknown" {
+		return "unknown"
 	}
 
 	return strings.Split(name, ".")[0] // Se il nome è "s-0.default", prendiamo solo "s-0"
 }
 
 // Funzione che aggiorna o crea lo stato per una trace quando riceve uno span
-func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deploy string, useForTiming bool) {
+func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deploy string, opName string) {
 	// Recupera o crea traceState
 	c.tracesMu.Lock()
 	ts := c.traces[traceID]
@@ -218,15 +248,15 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 	if end != 0 {
 		if start < ts.minStart {
 			ts.minStart = start
+			ts.rootServiceName = svc
+			ts.rootOperationName = opName
 		}
 		if end > ts.maxEnd {
 			ts.maxEnd = end
 		}
 		// Aggiunge l'intervallo per il servizio, se richiesto (dipende ad es. se vogliamo usare anche i tempi degli spans di Istio oppure no)
 		if svc != "" && svc != "unknown" {
-			if useForTiming {
-				ts.serviceIntervals[svc] = append(ts.serviceIntervals[svc], interval{start: start, end: end})
-			}
+			ts.serviceIntervals[svc] = append(ts.serviceIntervals[svc], interval{start: start, end: end})
 
 			// Salviamo anche il deployment del servizio, se lo troviamo
 			// Se abbiamo già un nome (es. da uno span OTel), non lo sovrascriviamo con "unknown" (es. da uno span Istio che non ha il nome del deployment tra gli attributi)
@@ -244,7 +274,7 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 }
 
 // Restituisce lo stato cumulativo di un histogram (count, sum, buckets) identificato da una chiave, se lo stato non esiste ancora allora lo crea
-func (c *connectorImp) getHistogramState(key string, bucketCount int) *histogramState {
+func (c *connectorImp) getHistogramState(key histKey, bucketCount int) *histogramState {
 	// Acquisisce un lock in lettura (RLock) sul histState map. Recupera lo stato dell’histogram per la key e rilascia il lock
 	c.histMu.RLock()
 	hs := c.histState[key]
@@ -276,7 +306,10 @@ func (c *connectorImp) getHistogramState(key string, bucketCount int) *histogram
 
 	if c.logger != nil {
 		c.logger.Debug("DEBUG_LOGS: created new histogramState",
-			zap.String("key", key),
+			zap.String("key_rootService: ", key.rootService),
+			zap.String("key_rootOperation: ", key.rootOperation),
+			zap.String("key_currentSvc: ", key.currentSvc),
+			zap.String("key_currentDeploy: ", key.currentDeploy),
 			zap.Int("buckets_len", bucketCount),
 			zap.Int64("start_ns", int64(now)),
 		)
@@ -286,7 +319,7 @@ func (c *connectorImp) getHistogramState(key string, bucketCount int) *histogram
 }
 
 // Aggiorna lo stato cumulativo di un istogramma
-func (c *connectorImp) updateHistogram(key string, latencyNs uint64, bounds []float64) {
+func (c *connectorImp) updateHistogram(key histKey, latencyNs uint64, bounds []float64) {
 	hs := c.getHistogramState(key, len(bounds)+1) // Recupera lo stato corrente dell’histogram per la chiave key. Se non esiste, lo crea. il +1 serve per il bound +inf
 
 	// Aggiorno lo stato dell'istogramma
@@ -310,7 +343,10 @@ func (c *connectorImp) updateHistogram(key string, latencyNs uint64, bounds []fl
 	hs.buckets[idx]++
 
 	c.logger.Debug("DEBUG_LOGS: histogram update",
-		zap.String("key", key),
+		zap.String("key_rootService: ", key.rootService),
+		zap.String("key_rootOperation: ", key.rootOperation),
+		zap.String("key_currentSvc: ", key.currentSvc),
+		zap.String("key_currentDeploy: ", key.currentDeploy),
 		zap.Uint64("count", hs.count),
 		zap.Uint64("sum_ns", hs.sumNs),
 		zap.Any("buckets", hs.buckets),
@@ -392,7 +428,22 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	latencyMs := float64(latencyNs) / 1e6
 
 	// Aggiorno l'istogramma cumulativo E2E
-	const e2eKey = "__e2e__"
+	rootSvc := ts.rootServiceName
+	rootOp := ts.rootOperationName
+
+	if rootSvc == "" {
+		rootSvc = "unknown"
+	}
+	if rootOp == "" {
+		rootOp = "unknown"
+	}
+
+	e2eKey := histKey{
+		rootService:   rootSvc,
+		rootOperation: rootOp,
+		currentSvc:    "none",
+		currentDeploy: "none",
+	}
 	c.updateHistogram(e2eKey, latencyNs, defaultBounds)
 
 	// Se richiesto, faccio il merge degli intervalli per i singoli servizi e aggiorno l'istogramma
@@ -411,8 +462,13 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 
 			// Creiamo una chiave composta per l'istogramma globale. Questo permette a Prometheus di avere serie distinte per ogni deployment
 			// Formato: "service:nome-servizio|nome-deployment"
-			key := "service:" + svc + "|" + deploy
-			c.updateHistogram(key, activeNs, defaultBounds)
+			keySvc := histKey{
+				rootService:   rootSvc,
+				rootOperation: rootOp,
+				currentSvc:    svc,
+				currentDeploy: deploy,
+			}
+			c.updateHistogram(keySvc, activeNs, defaultBounds)
 		}
 	}
 
@@ -453,7 +509,7 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		return
 	}
 	// Copia superficiale delle chiavi e dei puntatori
-	local := make(map[string]*histogramState, len(c.histState))
+	local := make(map[histKey]*histogramState, len(c.histState))
 	for k, v := range c.histState {
 		local[k] = v
 	}
@@ -468,38 +524,18 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		startTs := hs.start
 		hs.mu.Unlock()
 
-		// Decido che nome di metrica usare
-		var metricName string
-		attrsSvc := ""
-		attrsDeploy := ""
-
-		if key == "__e2e__" {
-			metricName = c.cfg.E2ELatencyMetricName
-			attrsSvc = "none"
-			attrsDeploy = "none"
-		} else if strings.HasPrefix(key, "service:") {
-			metricName = c.cfg.ServiceLatencyMetricName
-
-			// Rimuoviamo il prefisso e dividiamo servizio e deployment
-			content := strings.TrimPrefix(key, "service:")
-			parts := strings.Split(content, "|")
-
-			attrsSvc = parts[0]
-			if len(parts) > 1 {
-				attrsDeploy = parts[1]
-			} else {
-				attrsDeploy = "unknown"
-			}
-		}
-
 		// Appendo la metrica (histogram) al payload
 		m := sm.Metrics().AppendEmpty()
-		m.SetName(metricName)
-		if metricName == c.cfg.E2ELatencyMetricName {
+
+		// Decido che nome di metrica usare
+		if key.currentSvc == "none" {
+			m.SetName(c.cfg.E2ELatencyMetricName)
 			m.SetDescription("End-to-end workflow latency")
 		} else {
+			m.SetName(c.cfg.ServiceLatencyMetricName)
 			m.SetDescription("Per-service latency (active time)")
 		}
+
 		m.SetUnit("s")
 
 		h := m.SetEmptyHistogram()
@@ -512,8 +548,14 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		dp.SetCount(count)
 		dp.SetSum(float64(sumNs) / 1e9) // somma in secondi
 		dp.BucketCounts().FromRaw(bucketsCopy)
-		dp.Attributes().PutStr("generated_from_service", attrsSvc)
-		dp.Attributes().PutStr("service_deployment_name", attrsDeploy)
+
+		dp.Attributes().PutStr("root_service", key.rootService)
+		dp.Attributes().PutStr("root_operation", key.rootOperation)
+
+		if key.currentSvc != "none" {
+			dp.Attributes().PutStr("generated_from_service", key.currentSvc)
+			dp.Attributes().PutStr("service_deployment_name", key.currentDeploy)
+		}
 	}
 
 	// Emetto lo snapshot in un'unica chiamata
@@ -550,29 +592,33 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 				tid := span.TraceID().String() // Controllo i trace_id dagli spans, per capire quali traces diverse sono arrivate insieme
 				traceIDs[tid] = struct{}{}
 
-				start := span.StartTimestamp()
-				end := span.EndTimestamp()
+				isIstioSpan := c.isIstioSidecar(span) // Verifichiamo se è uno span di Istio
+				// Se UsingIstio è false ed è uno span Istio allora non viene considerato, in tutti gli altri casi si
+				if !(!c.cfg.UsingIstio && isIstioSpan) {
 
-				svcToUpdate := ""
-				deployName := ""
-				useForTiming := false
+					start := span.StartTimestamp()
+					end := span.EndTimestamp()
 
-				if c.cfg.ServiceLatencyMode {
-					// Determina il nome del servizio (controllando vari attributi a seconda se stiamo usando Istio o meno)
-					rawSvcName := c.getServiceName(span, rs.Resource())
-					svcToUpdate = c.normalizeServiceName(rawSvcName)
-					deployName = c.getDeploymentName(span, rs.Resource())
+					svcToUpdate := ""
+					deployName := ""
+					opName := ""
 
-					// Qui verifichiamo se lo span è quello giusto per il calcolo richiesto
-					isIstioSpan := c.isIstioSidecar(span)
+					if c.cfg.UsingIstio && isIstioSpan {
+						opName = c.getCleanOperationName(span)
+					} else if !c.cfg.UsingIstio && !isIstioSpan {
+						opName = span.Name()
+					}
 
-					// Se UsingIstio è true, consideriamo solo gli span di Istio
-					// Se è false, consideriamo solo quelli applicativi (non-Istio)
-					useForTiming = (c.cfg.UsingIstio && isIstioSpan) || (!c.cfg.UsingIstio && !isIstioSpan)
+					if c.cfg.ServiceLatencyMode {
+						// Determina il nome del servizio (controllando vari attributi a seconda se stiamo usando Istio o meno)
+						rawSvcName := c.getServiceName(span, rs.Resource())
+						svcToUpdate = c.normalizeServiceName(rawSvcName)
+						deployName = c.getDeploymentName(span, rs.Resource())
+					}
+
+					// Aggiorno lo stato per la trace
+					c.updateTraceStateForSpan(tid, start, end, svcToUpdate, deployName, opName)
 				}
-
-				// Aggiorno lo stato per la trace
-				c.updateTraceStateForSpan(tid, start, end, svcToUpdate, deployName, useForTiming)
 			}
 		}
 	}
