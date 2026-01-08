@@ -138,7 +138,7 @@ func (c *connectorImp) getCleanOperationName(span ptrace.Span) string {
 
 	if hasMethod && hasURL {
 		// Usa net/url per estrarre solo il path (es. /startProcess) escludento l'IP
-		if parsed, err := url.Parse(fullURL.AsString()); err == nil && parsed.Path != "" {
+		if parsed, err := url.Parse(fullURL.AsString()); err == nil {
 			return method.AsString() + " " + parsed.Path
 		}
 	}
