@@ -35,10 +35,11 @@ type histogramState struct {
 
 // Chiave composta per identificare un istogramma
 type histKey struct {
-	rootService   string
-	rootOperation string
-	currentSvc    string // Usato per distinguere E2E (sarà "none") dai singoli servizi
-	currentDeploy string
+	rootService      string
+	rootOperation    string
+	currentSvc       string // Usato per distinguere E2E (sarà "none") dai singoli servizi
+	currentDeploy    string // Nome del deployment del servizio
+	currentNamespace string // Nome del namespace del servizio
 }
 
 // Intervallo usato per il merge degli spans di uno stesso servizio
@@ -53,16 +54,17 @@ type interval struct {
 // non è assicurato che tutti gli spans di una traccia arrivino insieme
 // NB: lo stato è in memoria del processo. Se il collector si riavvia lo stato viene perso
 type traceState struct {
-	mu                sync.Mutex
-	minStart          pcommon.Timestamp
-	maxEnd            pcommon.Timestamp
-	lastSeen          time.Time
-	spanCount         int
-	serviceIntervals  map[string][]interval // Lista per-service di intervalli non ancora mergiati
-	serviceToDeploy   map[string]string     // Associa un servizio al corrispettivo Deployment (l'ultimo trovato in caso un servizio sia associato a più deployment)
-	rootServiceName   string                // Il nome del servizio entry-point e l'operazione richieste identificano un workflow
-	rootOperationName string
-	emitted           bool // Indica se abbiamo già emesso la metrica per questa trace (evita doppie emissioni)
+	mu                 sync.Mutex
+	minStart           pcommon.Timestamp
+	maxEnd             pcommon.Timestamp
+	lastSeen           time.Time
+	spanCount          int
+	serviceIntervals   map[string][]interval // Lista per-service di intervalli non ancora mergiati
+	serviceToDeploy    map[string]string     // Associa un servizio al corrispettivo Deployment (l'ultimo trovato in caso un servizio sia associato a più deployment)
+	serviceToNamespace map[string]string     // Associa un servizio al corrispettivo namespace
+	rootServiceName    string                // Il nome del servizio entry-point e l'operazione richieste identificano un workflow
+	rootOperationName  string
+	emitted            bool // Indica se abbiamo già emesso la metrica per questa trace (evita doppie emissioni)
 }
 
 // connectorImp implementa connector.Traces quindi, dobbiamo implementare:
@@ -205,6 +207,19 @@ func (c *connectorImp) getDeploymentName(span ptrace.Span, resource pcommon.Reso
 	return "unknown"
 }
 
+func (c *connectorImp) getNamespaceName(span ptrace.Span, resource pcommon.Resource) string {
+	// Cerca negli attributi della risorsa (standard OTel)
+	if v, ok := resource.Attributes().Get("k8s.namespace.name"); ok && v.AsString() != "" {
+		return v.AsString()
+	}
+	// Fallback su attributi dello span
+	if v, ok := span.Attributes().Get("k8s.namespace.name"); ok && v.AsString() != "" {
+		return v.AsString()
+	}
+
+	return "unknown"
+}
+
 // Funzione per verificare se uno span è generato da Istio
 func (c *connectorImp) isIstioSidecar(span ptrace.Span) bool {
 	// Controllo se lo span contiene attributi tipici di Istio
@@ -226,17 +241,18 @@ func (c *connectorImp) normalizeServiceName(name string) string {
 }
 
 // Funzione che aggiorna o crea lo stato per una trace quando riceve uno span
-func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deploy string, opName string) {
+func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deploy string, namespace string, opName string) {
 	// Recupera o crea traceState
 	c.tracesMu.Lock()
 	ts := c.traces[traceID]
 	if ts == nil {
 		ts = &traceState{
-			minStart:         maxTimestamp,
-			maxEnd:           0,
-			lastSeen:         time.Now(),
-			serviceIntervals: make(map[string][]interval),
-			serviceToDeploy:  make(map[string]string),
+			minStart:           maxTimestamp,
+			maxEnd:             0,
+			lastSeen:           time.Now(),
+			serviceIntervals:   make(map[string][]interval),
+			serviceToDeploy:    make(map[string]string),
+			serviceToNamespace: make(map[string]string),
 		}
 		c.traces[traceID] = ts
 	}
@@ -264,6 +280,13 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 				ts.serviceToDeploy[svc] = deploy
 			} else if _, exists := ts.serviceToDeploy[svc]; !exists {
 				ts.serviceToDeploy[svc] = "unknown" // Inizializziamo a unknown solo se non ne abbiamo già uno associato al servizio
+			}
+
+			// Gestione Namespace (Nuova logica)
+			if namespace != "unknown" {
+				ts.serviceToNamespace[svc] = namespace
+			} else if _, exists := ts.serviceToNamespace[svc]; !exists {
+				ts.serviceToNamespace[svc] = "unknown"
 			}
 		}
 	}
@@ -407,6 +430,7 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	maxEnd := ts.maxEnd
 	serviceIntervals := ts.serviceIntervals
 	serviceToDeploy := ts.serviceToDeploy
+	serviceToNamespace := ts.serviceToNamespace
 	ts.emitted = true
 	ts.mu.Unlock()
 
@@ -439,10 +463,11 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	}
 
 	e2eKey := histKey{
-		rootService:   rootSvc,
-		rootOperation: rootOp,
-		currentSvc:    "none",
-		currentDeploy: "none",
+		rootService:      rootSvc,
+		rootOperation:    rootOp,
+		currentSvc:       "none",
+		currentDeploy:    "none",
+		currentNamespace: "none",
 	}
 	c.updateHistogram(e2eKey, latencyNs, defaultBounds)
 
@@ -460,13 +485,19 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 				deploy = "unknown"
 			}
 
+			namespace := serviceToNamespace[svc]
+			if namespace == "" {
+				namespace = "unknown"
+			}
+
 			// Creiamo una chiave composta per l'istogramma globale. Questo permette a Prometheus di avere serie distinte per ogni deployment
 			// Formato: "service:nome-servizio|nome-deployment"
 			keySvc := histKey{
-				rootService:   rootSvc,
-				rootOperation: rootOp,
-				currentSvc:    svc,
-				currentDeploy: deploy,
+				rootService:      rootSvc,
+				rootOperation:    rootOp,
+				currentSvc:       svc,
+				currentDeploy:    deploy,
+				currentNamespace: namespace,
 			}
 			c.updateHistogram(keySvc, activeNs, defaultBounds)
 		}
@@ -555,6 +586,7 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 		if key.currentSvc != "none" {
 			dp.Attributes().PutStr("generated_from_service", key.currentSvc)
 			dp.Attributes().PutStr("service_deployment_name", key.currentDeploy)
+			dp.Attributes().PutStr("service_deployment_namespace", key.currentNamespace)
 		}
 	}
 
@@ -602,6 +634,7 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 					svcToUpdate := ""
 					deployName := ""
 					opName := ""
+					namespaceName := ""
 
 					if c.cfg.UsingIstio && isIstioSpan {
 						opName = c.getCleanOperationName(span)
@@ -614,10 +647,11 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 						rawSvcName := c.getServiceName(span, rs.Resource())
 						svcToUpdate = c.normalizeServiceName(rawSvcName)
 						deployName = c.getDeploymentName(span, rs.Resource())
+						namespaceName = c.getNamespaceName(span, rs.Resource())
 					}
 
 					// Aggiorno lo stato per la trace
-					c.updateTraceStateForSpan(tid, start, end, svcToUpdate, deployName, opName)
+					c.updateTraceStateForSpan(tid, start, end, svcToUpdate, deployName, namespaceName, opName)
 				}
 			}
 		}
