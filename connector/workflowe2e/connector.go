@@ -322,6 +322,10 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 				ts.serviceToNamespace[svc] = "unknown"
 			}
 		}
+
+		if (ts.experimentName == "" || ts.experimentName == "none") && (expName != "none" && expName != "") {
+			ts.experimentName = expName
+		}
 	}
 	// Aggiorna lastSeen sempre (anche per span aperti)
 	ts.lastSeen = time.Now()
