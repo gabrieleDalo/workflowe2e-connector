@@ -31,6 +31,7 @@ func createDefaultConfig() component.Config {
 		ServiceLatencyMode:       false,          // default solo latenza E2E
 		ServiceNameAttribute:     "service.name", // default per OTel spans
 		ExperimentNameAttribute:  "experiment.name",
+		ExperimentNameHeader:     "experiment_name",
 		UsingIstio:               false,            // default: solo per OTel
 		TraceIdleTimeout:         15 * time.Second, // 30s
 		TraceFlushInterval:       3 * time.Second,  // 5s

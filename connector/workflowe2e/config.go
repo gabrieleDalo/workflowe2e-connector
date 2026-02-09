@@ -35,6 +35,9 @@ type Config struct {
 	// Identifica l'attributo (resource) che identifica il nome dell'esperimento
 	ExperimentNameAttribute string `mapstructure:"experiment_name_attribute"`
 
+	// Identifica la chiave che identifica il nome dell'esperimento nell'header baggage
+	ExperimentNameHeader string `mapstructure:"experiment_name_header"`
+
 	// Se true, significa che sta usando sia OTel che Istio per generare spans, altrimenti solo OTel
 	UsingIstio bool `mapstructure:"using_istio"`
 

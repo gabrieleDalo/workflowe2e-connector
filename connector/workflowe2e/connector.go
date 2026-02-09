@@ -248,13 +248,14 @@ func (c *connectorImp) normalizeServiceName(name string) string {
 func (c *connectorImp) getExperimentName(resource pcommon.Resource) string {
 
 	attrKey := c.cfg.ExperimentNameAttribute
+	headerKey := c.cfg.ExperimentNameHeader
 
 	if attrKey == "" {
 		attrKey = "none"
 	}
 
 	// Deriviamo la chiave interna del baggage (es: experiment_name)
-	baggageKey := strings.ReplaceAll(attrKey, ".", "_")
+	baggageKey := headerKey
 
 	if v, ok := resource.Attributes().Get(attrKey); ok {
 		raw := v.AsString()
