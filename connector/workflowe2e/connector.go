@@ -40,6 +40,7 @@ type histKey struct {
 	currentSvc       string // Usato per distinguere E2E (sarà "none") dai singoli servizi
 	currentDeploy    string // Nome del deployment del servizio
 	currentNamespace string // Nome del namespace del servizio
+	experimentName   string // Nome dell'esperimento in corso
 }
 
 // Intervallo usato per il merge degli spans di uno stesso servizio
@@ -64,6 +65,7 @@ type traceState struct {
 	serviceToNamespace map[string]string     // Associa un servizio al corrispettivo namespace
 	rootServiceName    string                // Il nome del servizio entry-point e l'operazione richieste identificano un workflow
 	rootOperationName  string
+	experimentName     string
 	emitted            bool // Indica se abbiamo già emesso la metrica per questa trace (evita doppie emissioni)
 }
 
@@ -240,8 +242,38 @@ func (c *connectorImp) normalizeServiceName(name string) string {
 	return strings.Split(name, ".")[0] // Se il nome è "s-0.default", prendiamo solo "s-0"
 }
 
+// Funzione che estrae il nome dell'esperimento dal rispettivo resource attribute, il baggage viene inserito come lista, perciò dobbiamo prendere il valore che ci interessa a noi
+// Assumiamo che la chiave sia uguale al nome dell'attributo ma con un _ invece del .
+// In alternativa, dovrei agggiungere un altro parametro di configurazione per specificare il nome della chiave da prendere dal baggage
+func (c *connectorImp) getExperimentName(resource pcommon.Resource) string {
+
+	attrKey := c.cfg.ExperimentNameAttribute
+
+	if attrKey == "" {
+		attrKey = "none"
+	}
+
+	// Deriviamo la chiave interna del baggage (es: experiment_name)
+	baggageKey := strings.ReplaceAll(attrKey, ".", "_")
+
+	if v, ok := resource.Attributes().Get(attrKey); ok {
+		raw := v.AsString()
+		// Parsing della lista: ["chiave=valore"] -> valore
+		// Cerchiamo il prefisso dinamico (es: ["experiment_name=)
+		prefix := "[\"" + baggageKey + "="
+		if strings.HasPrefix(raw, prefix) {
+			clean := strings.TrimPrefix(raw, prefix)
+			clean = strings.TrimSuffix(clean, "\"]")
+			return clean
+		}
+		return raw // Fallback se non ha il formato lista
+	}
+
+	return "none"
+}
+
 // Funzione che aggiorna o crea lo stato per una trace quando riceve uno span
-func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deploy string, namespace string, opName string) {
+func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deploy string, namespace string, opName string, expName string) {
 	// Recupera o crea traceState
 	c.tracesMu.Lock()
 	ts := c.traces[traceID]
@@ -253,6 +285,7 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 			serviceIntervals:   make(map[string][]interval),
 			serviceToDeploy:    make(map[string]string),
 			serviceToNamespace: make(map[string]string),
+			experimentName:     expName,
 		}
 		c.traces[traceID] = ts
 	}
@@ -468,6 +501,7 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 		currentSvc:       "none",
 		currentDeploy:    "none",
 		currentNamespace: "none",
+		experimentName:   ts.experimentName,
 	}
 	c.updateHistogram(e2eKey, latencyNs, defaultBounds)
 
@@ -498,6 +532,7 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 				currentSvc:       svc,
 				currentDeploy:    deploy,
 				currentNamespace: namespace,
+				experimentName:   ts.experimentName,
 			}
 			c.updateHistogram(keySvc, activeNs, defaultBounds)
 		}
@@ -582,6 +617,7 @@ func (c *connectorImp) emitHistSnapshot(ctx context.Context) {
 
 		dp.Attributes().PutStr("root_service", key.rootService)
 		dp.Attributes().PutStr("root_operation", key.rootOperation)
+		dp.Attributes().PutStr("experiment_name", key.experimentName)
 
 		if key.currentSvc != "none" {
 			dp.Attributes().PutStr("generated_from_service", key.currentSvc)
@@ -616,6 +652,9 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 	// Aggiorno lo stato, per ogni span
 	for i := 0; i < td.ResourceSpans().Len(); i++ {
 		rs := td.ResourceSpans().At(i)
+
+		experimentName := c.getExperimentName(rs.Resource())
+
 		for j := 0; j < rs.ScopeSpans().Len(); j++ {
 			ss := rs.ScopeSpans().At(j)
 			spans := ss.Spans()
@@ -651,7 +690,7 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 					}
 
 					// Aggiorno lo stato per la trace
-					c.updateTraceStateForSpan(tid, start, end, svcToUpdate, deployName, namespaceName, opName)
+					c.updateTraceStateForSpan(tid, start, end, svcToUpdate, deployName, namespaceName, opName, experimentName)
 				}
 			}
 		}

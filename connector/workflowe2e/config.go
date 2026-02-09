@@ -32,6 +32,9 @@ type Config struct {
 	// Es.: "service.name"
 	ServiceNameAttribute string `mapstructure:"service_name_attribute"`
 
+	// Identifica l'attributo (resource) che identifica il nome dell'esperimento
+	ExperimentNameAttribute string `mapstructure:"experiment_name_attribute"`
+
 	// Se true, significa che sta usando sia OTel che Istio per generare spans, altrimenti solo OTel
 	UsingIstio bool `mapstructure:"using_istio"`
 
