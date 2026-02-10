@@ -35,6 +35,7 @@ func createDefaultConfig() component.Config {
 		UsingIstio:               false,            // default: solo per OTel
 		TraceIdleTimeout:         15 * time.Second, // 30s
 		TraceFlushInterval:       3 * time.Second,  // 5s
+		DBURL:                    "",               // Vuoto = DB disabilitato
 	}
 }
 

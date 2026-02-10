@@ -2,12 +2,16 @@ package workflowe2e
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	_ "github.com/lib/pq"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/connector"
@@ -78,6 +82,8 @@ type connectorImp struct {
 	cfg             *Config
 	logger          *zap.Logger
 
+	db *sql.DB
+
 	// Stato cumulativo degli histogram
 	// permette di tenere lo stato memorizzato tra più chiamate a ConsumeTraces
 	histMu    sync.RWMutex
@@ -117,12 +123,54 @@ func newConnector(
 		traces:             make(map[string]*traceState),
 		traceIdleTimeout:   myCfg.TraceIdleTimeout,
 		traceFlushInterval: myCfg.TraceFlushInterval,
+		db:                 nil,
 	}, nil
 }
 
 // Definisce le capacità del connector, in particolare se modifica i dati ricevuti o no
 func (c *connectorImp) Capabilities() consumer.Capabilities {
 	return consumer.Capabilities{MutatesData: false}
+}
+
+// Funzione helper per salvare i dati nel DB in modo asincrono (per non bloccare il resto del connector)
+func (c *connectorImp) saveToDatabase(traceID string, experimentName string, startTs, endTs pcommon.Timestamp, latencyMs float64, svcLatencies map[string]float64) {
+
+	// Se il DB non è configurato, esci
+	if c.db == nil {
+		return
+	}
+
+	// Goroutine per non bloccare il collector, il Collector non deve aspettare che Postgres risponda per processare la traccia successiva
+	go func() {
+		// Converte la mappa delle latenze per service in una stringa di byte in formato JSON
+		jsonBytes, err := json.Marshal(svcLatencies)
+		if err != nil {
+			c.logger.Error("DB: JSON Marshal error", zap.Error(err))
+			return
+		}
+
+		// Converte i Timestamp (ns) in Time.Time (UTC) per Postgres
+		startTime := time.Unix(0, int64(startTs)).UTC()
+		endTime := time.Unix(0, int64(endTs)).UTC()
+
+		// Esegue Insert con timeout, crea un "contesto" che scade dopo n secondi
+		// Se Postgres si blocca (es. deadlock o rete isolata), non vogliamo che migliaia di goroutine rimangano appese all'infinito consumando memoria
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// I Segnaposti ($1, $2...): Proteggono da SQL Injection (anche se qui i dati sono "puliti", è la prassi di sicurezza)
+		query := `
+            INSERT INTO trace_results (trace_id, experiment_name, start_time, end_time, latency_ms, services_latency)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (trace_id) DO NOTHING`
+
+		// Invia la query al database usando il timeout definito sopra
+		_, err = c.db.ExecContext(ctx, query, traceID, experimentName, startTime, endTime, latencyMs, jsonBytes)
+
+		if err != nil {
+			c.logger.Error("DB: Insert failed", zap.Error(err))
+		}
+	}()
 }
 
 // Utility per trasformare una map usata come insieme in una slice
@@ -510,12 +558,21 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	}
 	c.updateHistogram(e2eKey, latencyNs, defaultBounds)
 
+	// Creiamo una mappa per le latenza per servizio
+	// Ci serve per convertirla in JSON per il db
+	dbServiceLatencies := make(map[string]float64)
+
 	// Se richiesto, faccio il merge degli intervalli per i singoli servizi e aggiorno l'istogramma
 	if c.cfg.ServiceLatencyMode {
 		for svc, ivs := range serviceIntervals {
 			activeNs := mergeIntervals(ivs)
 			if activeNs == 0 {
 				continue
+			}
+
+			// Se non c'è il db non serve la mappa
+			if c.db != nil {
+				dbServiceLatencies[svc] = float64(activeNs) / 1e6
 			}
 
 			// Recuperiamo il deployment associato a questo servizio nella traccia
@@ -542,6 +599,9 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 			c.updateHistogram(keySvc, activeNs, defaultBounds)
 		}
 	}
+
+	// Salviamo i dati che ci interessano nel database
+	c.saveToDatabase(traceID, ts.experimentName, minStart, maxEnd, latencyMs, dbServiceLatencies)
 
 	// NB: non emettiamo le metriche direttamente qui per evitare emissioni duplicate e problemi di timing con Prometheus scrapes
 	// Aggiorniamo solo lo stato interno (histState) e lasciamo che il flusher periodico (emitHistSnapshot) esponga le metriche
@@ -717,6 +777,20 @@ func (c *connectorImp) Start(ctx context.Context, host component.Host) error {
 		)
 	}
 
+	// Se configurato, mi connetto al db
+	if c.cfg.DBURL != "" {
+		db, err := sql.Open("postgres", c.cfg.DBURL)
+		if err != nil {
+			c.logger.Error("DB: Could not open connection", zap.Error(err))
+		} else {
+			// Configuriamo il pool di connessioni (opzionale ma consigliato)
+			db.SetMaxOpenConns(10)
+			db.SetMaxIdleConns(5)
+			c.db = db
+			c.logger.Info("DB: Connection pool initialized")
+		}
+	}
+
 	// Lancia la goroutine di flush periodico per finalizzare le traces inattive (esegue in background)
 	// Ogni traceFlushInterval il flusher controlla tutte le trace e, per ognuna, verifica se è passato più di traceIdleTimeout dall’ultima volta che ha visto uno span di quella trace. Se sì → la finalizza
 	// Inoltre ad ogni tick emettiamo lo snapshot (emitHistSnapshot) degli histogram cumulativi.
@@ -786,6 +860,12 @@ func (c *connectorImp) Shutdown(ctx context.Context) error {
 	}
 
 	c.emitHistSnapshot(context.Background())
+
+	// Se era presente, termino la connessione al db
+	if c.db != nil {
+		c.logger.Info("DB: Closing database connection...")
+		c.db.Close()
+	}
 
 	return nil
 }

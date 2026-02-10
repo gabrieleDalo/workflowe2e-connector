@@ -48,6 +48,9 @@ type Config struct {
 	// TraceFlushInterval è la frequenza con cui il connector controlla
 	// le traces e finalizza quelle scadute (es. "5s").
 	TraceFlushInterval time.Duration `mapstructure:"trace_flush_interval"`
+
+	// URL per la connessione al DB Postgres
+	DBURL string `mapstructure:"db_url"`
 }
 
 // Validate verifica la correttezza della configurazione.
