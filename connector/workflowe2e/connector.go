@@ -133,7 +133,7 @@ func (c *connectorImp) Capabilities() consumer.Capabilities {
 }
 
 // Funzione helper per salvare i dati nel DB in modo asincrono (per non bloccare il resto del connector)
-func (c *connectorImp) saveToDatabase(traceID string, experimentName string, startTs, endTs pcommon.Timestamp, latencyMs float64, svcLatencies map[string]float64) {
+func (c *connectorImp) saveToDatabase(traceID string, experimentName string, rootService string, rootOperation string, startTs, endTs pcommon.Timestamp, latencyMs float64, svcLatencies map[string]float64) {
 
 	// Se il DB non è configurato, esci
 	if c.db == nil {
@@ -160,8 +160,8 @@ func (c *connectorImp) saveToDatabase(traceID string, experimentName string, sta
 
 		// I Segnaposti ($1, $2...): Proteggono da SQL Injection (anche se qui i dati sono "puliti", è la prassi di sicurezza)
 		query := `
-            INSERT INTO trace_results (trace_id, experiment_name, start_time, end_time, latency_ms, services_latency)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO trace_results (trace_id, experiment_name, rootService, rootOperation, start_time, end_time, latency_ms, services_latency)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (trace_id) DO NOTHING`
 
 		// Invia la query al database usando il timeout definito sopra
@@ -601,7 +601,7 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	}
 
 	// Salviamo i dati che ci interessano nel database
-	c.saveToDatabase(traceID, ts.experimentName, minStart, maxEnd, latencyMs, dbServiceLatencies)
+	c.saveToDatabase(traceID, ts.experimentName, rootSvc, rootOp, minStart, maxEnd, latencyMs, dbServiceLatencies)
 
 	// NB: non emettiamo le metriche direttamente qui per evitare emissioni duplicate e problemi di timing con Prometheus scrapes
 	// Aggiorniamo solo lo stato interno (histState) e lasciamo che il flusher periodico (emitHistSnapshot) esponga le metriche
