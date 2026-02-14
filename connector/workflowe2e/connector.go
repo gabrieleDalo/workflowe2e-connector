@@ -165,7 +165,7 @@ func (c *connectorImp) saveToDatabase(traceID string, experimentName string, roo
             ON CONFLICT (trace_id) DO NOTHING`
 
 		// Invia la query al database usando il timeout definito sopra
-		_, err = c.db.ExecContext(ctx, query, traceID, experimentName, startTime, endTime, latencyMs, jsonBytes)
+		_, err = c.db.ExecContext(ctx, query, traceID, experimentName, rootService, rootOperation, startTime, endTime, latencyMs, jsonBytes)
 
 		if err != nil {
 			c.logger.Error("DB: Insert failed", zap.Error(err))
