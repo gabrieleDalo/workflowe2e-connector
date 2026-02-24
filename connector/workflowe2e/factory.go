@@ -32,7 +32,8 @@ func createDefaultConfig() component.Config {
 		ServiceNameAttribute:     "service.name", // default per OTel spans
 		ExperimentNameAttribute:  "experiment.name",
 		ExperimentNameHeader:     "experiment_name",
-		UsingIstio:               false,            // default: solo per OTel
+		UsingIstio:               false, // default: solo per OTel
+		N_SpansTrace:             0,
 		TraceIdleTimeout:         15 * time.Second, // 30s
 		TraceFlushInterval:       3 * time.Second,  // 5s
 		DBURL:                    "",               // Vuoto = DB disabilitato

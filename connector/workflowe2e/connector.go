@@ -63,7 +63,7 @@ type traceState struct {
 	minStart           pcommon.Timestamp
 	maxEnd             pcommon.Timestamp
 	lastSeen           time.Time
-	spanCount          int
+	spanIDs            map[string]struct{}   // Set di spans unici per contare gli spans, senza ripetizioni
 	serviceIntervals   map[string][]interval // Lista per-service di intervalli non ancora mergiati
 	serviceToDeploy    map[string]string     // Associa un servizio al corrispettivo Deployment (l'ultimo trovato in caso un servizio sia associato a più deployment)
 	serviceToNamespace map[string]string     // Associa un servizio al corrispettivo namespace
@@ -322,15 +322,22 @@ func (c *connectorImp) getExperimentName(resource pcommon.Resource) string {
 }
 
 // Funzione che aggiorna o crea lo stato per una trace quando riceve uno span
-func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommon.Timestamp, svc string, deploy string, namespace string, opName string, expName string) {
+func (c *connectorImp) updateTraceStateForSpan(traceID string, spanID string, start, end pcommon.Timestamp, svc string, deploy string, namespace string, opName string, expName string) {
 	// Recupera o crea traceState
 	c.tracesMu.Lock()
 	ts := c.traces[traceID]
 	if ts == nil {
+		// Inizializziamo spanIDs solo se l'utente ha abilitato NSpansTrace (>0)
+		var spanIDs map[string]struct{}
+		if c.cfg != nil && c.cfg.N_SpansTrace > 0 {
+			spanIDs = make(map[string]struct{})
+		}
+
 		ts = &traceState{
 			minStart:           maxTimestamp,
 			maxEnd:             0,
 			lastSeen:           time.Now(),
+			spanIDs:            spanIDs,
 			serviceIntervals:   make(map[string][]interval),
 			serviceToDeploy:    make(map[string]string),
 			serviceToNamespace: make(map[string]string),
@@ -339,6 +346,9 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 		c.traces[traceID] = ts
 	}
 	c.tracesMu.Unlock()
+
+	// Variabile per decidere se finalizzare la trace (se sono arrivati tutti i suoi spans)
+	needFinalize := false
 
 	// Aggiornamento dei tempi
 	ts.mu.Lock()
@@ -378,8 +388,29 @@ func (c *connectorImp) updateTraceStateForSpan(traceID string, start, end pcommo
 	}
 	// Aggiorna lastSeen sempre (anche per span aperti)
 	ts.lastSeen = time.Now()
-	ts.spanCount++
+
+	// --- gestione conteggio span unici (solo se abilitato nella config) ---
+	if c.cfg != nil && c.cfg.N_SpansTrace > 0 && spanID != "" {
+		// Assicuriamoci che la mappa esista
+		if ts.spanIDs == nil {
+			ts.spanIDs = make(map[string]struct{})
+		}
+		// Aggiungo lo span se è nuovo (non è già presente)
+		if _, exists := ts.spanIDs[spanID]; !exists {
+			ts.spanIDs[spanID] = struct{}{}
+		}
+		// Se abbiamo raggiunto il numero atteso di span, richiediamo di finalizzare la trace
+		if !ts.emitted && len(ts.spanIDs) >= c.cfg.N_SpansTrace {
+			needFinalize = true
+		}
+	}
+
 	ts.mu.Unlock()
+
+	// Finalizzo la trace fuori dal lock per evitare deadlock
+	if needFinalize {
+		c.finalizeTrace(traceID)
+	}
 }
 
 // Restituisce lo stato cumulativo di un histogram (count, sum, buckets) identificato da una chiave, se lo stato non esiste ancora allora lo crea
@@ -518,6 +549,12 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 	serviceToDeploy := ts.serviceToDeploy
 	serviceToNamespace := ts.serviceToNamespace
 	ts.emitted = true
+
+	nSpans := 0
+	if ts.spanIDs != nil {
+		nSpans = len(ts.spanIDs)
+	}
+
 	ts.mu.Unlock()
 
 	// Rimuovo la trace dallo stato globale
@@ -610,6 +647,7 @@ func (c *connectorImp) finalizeTrace(traceID string) {
 		c.logger.Debug("DEBUG_LOGS: finalizeTrace",
 			zap.String("trace_id", traceID),
 			zap.Float64("latency_ms", latencyMs),
+			zap.Int("n_spans", nSpans),
 		)
 	}
 }
@@ -755,7 +793,8 @@ func (c *connectorImp) ConsumeTraces(ctx context.Context, td ptrace.Traces) erro
 					}
 
 					// Aggiorno lo stato per la trace
-					c.updateTraceStateForSpan(tid, start, end, svcToUpdate, deployName, namespaceName, opName, experimentName)
+					spanID := span.SpanID().String()
+					c.updateTraceStateForSpan(tid, spanID, start, end, svcToUpdate, deployName, namespaceName, opName, experimentName)
 				}
 			}
 		}

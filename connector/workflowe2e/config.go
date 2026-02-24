@@ -41,6 +41,9 @@ type Config struct {
 	// Se true, significa che sta usando sia OTel che Istio per generare spans, altrimenti solo OTel
 	UsingIstio bool `mapstructure:"using_istio"`
 
+	// Se true, significa che sta usando sia OTel che Istio per generare spans, altrimenti solo OTel
+	N_SpansTrace int `mapstructure:"n_spans_for_trace"`
+
 	// TraceIdleTimeout è il tempo di inattività dopo il quale una trace
 	// viene considerata completa e finalizzata (es. "30s").
 	TraceIdleTimeout time.Duration `mapstructure:"trace_idle_timeout"`
@@ -71,6 +74,10 @@ func (c *Config) Validate() error {
 
 	if c.ServiceLatencyMode && c.ServiceNameAttribute == "" {
 		return fmt.Errorf("service_name_attribute must not be empty")
+	}
+
+	if c.N_SpansTrace < 0 {
+		return fmt.Errorf("n_spans_for_trace must not be >= 0")
 	}
 
 	// Convalida dei timeout
