@@ -13,19 +13,6 @@ Its also possible to connect to a database for saving data for future analysis.
 
 The **bounds** used for the **histogram buckets** are: [2ms, 4ms, 6ms, 8ms, 10ms, 50ms, 100ms, 200ms, 400ms, 800ms, 1s, 1.4s, 2s, 5s, 10s, 15s, +Inf]
 
-## Warnings
-
-The following warnings relate to the use of the connector:  
-
-- **Stateful in-memory — state loss on restart**: this connector keeps histogram and trace state in memory. If the Collector or Pod restarts, the state is lost and metrics start again from zero.  
-Mitigation: use a centralized Collector or implement external persistence/replication;
-- **Dependency on delivery of all spans for the same trace**: correct latency calculation depends on spans belonging to the same trace arriving at the same Collector. If spans are distributed across multiple Collectors the trace may remain “fragmented.”  
-Mitigation: use a centralized Collector;
-- **Clock skew/unreliable timestamps**: latency calculation uses spans’ StartTimestamp/EndTimestamp. Unsynchronized clocks between pods/nodes can lead to maxEnd <= minStart and incorrect results.  
-Mitigation: ensure NTP / node time synchronization;
-- **Pull model Prometheus — emit periodic snapshots**: Prometheus scrapes endpoints in a pull model; the connector must emit periodic snapshots (even if nothing changed) or series may disappear between scrapes;
-- **Collector/SDK version compatibility**: the connector is built against a specific Collector/contrib version; updates to the OTel Collector may break APIs or behavior.
-
 ## Configurations
 
 The following settings can be configured (optional):  
@@ -42,6 +29,32 @@ The following settings can be configured (optional):
 - `trace_flush_interval` (default: `3s`): how often the connector checks traces and finalizes those that have expired (i.e. passed the trace_idle_timeout);
 - `db_url` (default: ""): URL of a database (PostgreSQL) to save data for future analysis (if used);
 
+## How it works
+
+The `workflowe2e` connector consumes trace data and turns it into cumulative latency histograms that can be exported to Prometheus.
+
+For each incoming span, the connector extracts the trace ID, service name, deployment name, namespace, operation name, and experiment name using the configured attributes and the selected `using_istio` mode. It then updates an in-memory state associated with the trace. This state keeps track of the earliest start timestamp, the latest end timestamp, and, when enabled, the set of unique span IDs and the per-service execution intervals.
+
+A trace is finalized in one of two ways. If `n_spans_for_trace` is greater than zero, the trace is finalized as soon as the expected number of unique spans has been observed. Otherwise, or if the trace is still incomplete, the connector waits until the trace has been idle for longer than `trace_idle_timeout`. A periodic background flush runs every `trace_flush_interval` to check for expired traces and finalize them.
+
+When a trace is finalized, the connector computes the end-to-end latency as `maxEnd - minStart`. If `service_latency_mode` is enabled, it also computes the active latency of each service by merging overlapping intervals belonging to the same service within the trace. This avoids double-counting time when a service starts, stops, and later resumes within the same workflow.
+
+The resulting latencies are accumulated into histogram state keyed by the root service, root operation, experiment name, and, for per-service metrics, the originating service, deployment, and namespace. Periodically, the connector emits a snapshot of all cumulative histograms so that Prometheus can scrape them continuously, even if no new traces arrive.
+
+If `db_url` is configured, the finalized trace summary is also written asynchronously to PostgreSQL for later analysis. The database write is performed in a separate goroutine with a timeout so that trace ingestion is not blocked by slow or unavailable storage.
+
+## Warnings
+
+The following warnings relate to the use of the connector:  
+
+- **Stateful in-memory — state loss on restart**: this connector keeps histogram and trace state in memory. If the Collector or Pod restarts, the state is lost and metrics start again from zero.  
+Mitigation: use a centralized Collector or implement external persistence/replication;
+- **Dependency on delivery of all spans for the same trace**: correct latency calculation depends on spans belonging to the same trace arriving at the same Collector. If spans are distributed across multiple Collectors the trace may remain “fragmented.”  
+Mitigation: use a centralized Collector;
+- **Clock skew/unreliable timestamps**: latency calculation uses spans’ StartTimestamp/EndTimestamp. Unsynchronized clocks between pods/nodes can lead to maxEnd <= minStart and incorrect results.  
+Mitigation: ensure NTP / node time synchronization;
+- **Pull model Prometheus — emit periodic snapshots**: Prometheus scrapes endpoints in a pull model; the connector must emit periodic snapshots (even if nothing changed) or series may disappear between scrapes;
+- **Collector/SDK version compatibility**: the connector is built against a specific Collector/contrib version; updates to the OTel Collector may break APIs or behavior.
 
 ## Examples
 
