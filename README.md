@@ -112,7 +112,7 @@ ENTRYPOINT ["/otel/otelcol"]
 ```
 
 - After that I can build the image on minikube so that the cluster sees it right away, so I start minikube and then do:
-- 
+  
 ```
 eval $(minikube docker-env)
 docker build --no-cache -t workflowe2e/otelcol:0.1.0 .
