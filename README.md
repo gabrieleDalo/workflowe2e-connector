@@ -102,7 +102,7 @@ config:
         wait_duration: 10s        
         num_traces: 1000       
         num_workers: 1
-...
+    ...
     connectors:
         workflowe2e:
           e2e_latency_metric_name: workflow_e2e_latency
@@ -116,7 +116,7 @@ config:
           trace_idle_timeout: 80s
           trace_flush_interval: 5s
           db_url: "postgres://user:password@postgres-service.observability.svc.cluster.local:5432/tracing_db?sslmode=disable"
-  ...
+    ...
     service:
       pipelines:
               traces:
