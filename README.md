@@ -61,19 +61,71 @@ Mitigation: ensure NTP / node time synchronization;
 The following is a simple example usage of the workflowe2e connector (taken from an OTel Collector config.yaml):  
 
 ```
-  connectors:
-      workflowe2e:
-        e2e_latency_metric_name: workflow_e2e_latency
-        service_latency_metric_name: workflow_service_latency
-        service_latency_mode: true
-        service_name_attribute: service.name
-        experiment_name_attribute: experiment.name
-        experiment_name_header: experiment_name
-        using_istio: true
-        n_spans_for_trace: 10
-        trace_idle_timeout: 80s
-        trace_flush_interval: 5s
-        db_url: "postgres://user:password@postgres-service.observability.svc.cluster.local:5432/tracing_db?sslmode=disable"
+...
+config:
+    receivers:     
+      otlp:          
+        protocols:   
+          grpc:
+            endpoint: "0.0.0.0:4317"
+          http:
+            endpoint: "0.0.0.0:4318"
+    processors:   
+      batch:
+        timeout: 200ms
+
+      transform:
+        error_mode: ignore    
+        trace_statements:    
+          - context: span
+            statements:
+              # Copiamo il valore dell'attributo dagli span attributes nei resource attributes
+              - set(resource.attributes["experiment.name"], attributes["http.request.header.baggage"]) where attributes["http.request.header.baggage"] != nil  
+
+      # Applichiamo un filtro per scartare tutte le traces che non ci interessa vengano mandate a Jaeger, es. per richieste automatiche di liveness o readiness, ecc...
+      filter/ottl:       
+        error_mode: ignore    
+        traces:     
+          span:   
+            - 'IsMatch(attributes["http.url"], ".*prometheus.*")'   
+            - 'IsMatch(attributes["http.url"], ".*health.*")'
+            - 'IsMatch(attributes["http.url"], ".*TraceService.*")'
+            - 'IsMatch(attributes["http.url"], ".*favicon.*")'
+            - 'IsMatch(attributes["http.route"], ".*prometheus.*")'
+            - 'IsMatch(attributes["http.route"], ".*/?ready.*")'
+            - 'IsMatch(attributes["http.target"], ".*/?ready.*")'
+            - 'IsMatch(attributes["http.route"], ".*/?health.*")'
+            - 'IsMatch(attributes["http.target"], ".*/?health.*")'
+            - 'IsMatch(attributes["http.route"], ".*/?metrics.*")'
+            - 'IsMatch(attributes["http.target"], ".*/?metrics.*")'
+      groupbytrace:
+        wait_duration: 10s        
+        num_traces: 1000       
+        num_workers: 1
+...
+    connectors:
+        workflowe2e:
+          e2e_latency_metric_name: workflow_e2e_latency
+          service_latency_metric_name: workflow_service_latency
+          service_latency_mode: true
+          service_name_attribute: service.name
+          experiment_name_attribute: experiment.name
+          experiment_name_header: experiment_name
+          using_istio: true
+          n_spans_for_trace: 10
+          trace_idle_timeout: 80s
+          trace_flush_interval: 5s
+          db_url: "postgres://user:password@postgres-service.observability.svc.cluster.local:5432/tracing_db?sslmode=disable"
+  ...
+    service:
+      pipelines:
+              traces:
+                receivers: [otlp]
+                processors: [filter/ottl,transform,groupbytrace,batch]
+                exporters: [workflowe2e]
+              metrics/workflowe2e:
+                receivers: [workflowe2e]
+                exporters: [prometheus]
 ```
 
 ## Usage
