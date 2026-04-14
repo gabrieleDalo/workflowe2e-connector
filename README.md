@@ -36,11 +36,11 @@ The following settings can be configured (optional):
 - `service_name_attribute` (default: `service.name`): the attribute name (span or resource) used to identify individual services when computing their latency;
 - `experiment_name_attribute` (default: `experiment.name`): resource attribute from which to read the experiment name;
 - `experiment_name_header` (default: `experiment_name`): “baggage-like” key used to extract the value from the attribute;
-- `using_istio` (default: `true`): whether Istio is also used to generate spans for traces, or only OTel if false (the logic used to parse service and operation names changes);
+- `using_istio` (default: `true`): whether Istio is also used to generate spans for traces, or only OpenTelemetry if false. The logic used to parse service and operation names changes if we are using Istio or only OTel;
 - `n_spans_for_trace` (default: `0`): number of spans to be expected for a trace (if 0 only the timeout mechanism is used);
 - `trace_idle_timeout` (default: `15s`): idle time (no spans received) after which a trace is considered complete and finalized (latency computed and exposed as a metric);
 - `trace_flush_interval` (default: `3s`): how often the connector checks traces and finalizes those that have expired (i.e. passed the trace_idle_timeout);
-- `db_url`: URL of a database (PostgreSQL) to save data for future analysis (if used);
+- `db_url` (default: ""): URL of a database (PostgreSQL) to save data for future analysis (if used);
 
 
 ## Examples
