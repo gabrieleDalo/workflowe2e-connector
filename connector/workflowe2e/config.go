@@ -8,13 +8,6 @@ import (
 // Config definisce la configurazione del connector workflowe2e.
 // Viene caricata dal Collector tramite mapstructure.
 type Config struct {
-	/* Può essere utile per traces con più workflow
-	// WorkflowAttribute è l'attributo (span o resource) usato
-	// per identificare il workflow a cui appartiene una trace.
-	// NON deve essere trace_id.
-	WorkflowAttribute string `mapstructure:"workflow_attribute"`
-	*/
-
 	// E2ELatencyMetricName è il nome della metrica Prometheus
 	// che espone la latenza E2E del workflow (in millisecondi)
 	E2ELatencyMetricName string `mapstructure:"e2e_latency_metric_name"`
@@ -59,11 +52,6 @@ type Config struct {
 // Validate verifica la correttezza della configurazione.
 // Viene chiamata automaticamente dal Collector all'avvio.
 func (c *Config) Validate() error {
-	/*
-		if c.WorkflowAttribute == "" {
-			return fmt.Errorf("workflow_attribute must not be empty")
-		}
-	*/
 	if c.E2ELatencyMetricName == "" {
 		return fmt.Errorf("e2e_latency_metric_name must not be empty")
 	}
