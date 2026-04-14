@@ -124,7 +124,7 @@ USER nonroot:nonroot
 ENTRYPOINT ["/otel/otelcol"]
 ```
 
-- After that I can build the image on minikube so that the cluster sees it right away, so I start minikube and then do:
+- After that I can build the image on minikube so that the cluster sees it right away, so I start minikube and then do (inside the folder with the Dockerfile):
   
 ```
 eval $(minikube docker-env)
