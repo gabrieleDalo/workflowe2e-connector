@@ -63,3 +63,71 @@ The following is a simple example usage of the workflowe2e connector (taken from
         db_url: "postgres://user:password@postgres-service.observability.svc.cluster.local:5432/tracing_db?sslmode=disable"
 ```
 
+## Usage
+
+To use this component you need to build it first, for example you can use an existing distribution of an OpenTelemetry Collector and extend it with this connector.
+Example of steps:
+
+1) In the YAML manifest of the OTel Collector distribution add:
+
+```
+dist:
+  module: github.com/gabrieleDalo/otelcol-workflowe2e
+  name: otelcol-workflowe2e
+  description: OTel Collector Contrib + workflow E2E connector
+  version: 0.1.0
+  output_path: ./_build
+  build_tags: "grpcnotrace"
+
+...
+
+connectors:
+  ...
+  - gomod: github.com/gabrieleDalo/workflowe2e-connector v0.1.36
+    import: github.com/gabrieleDalo/workflowe2e-connector/connector/workflowe2e
+...
+```
+
+2) Use a tool such as OCB (https://github.com/open-telemetry/opentelemetry-collector/tree/main/cmd/builder) to build the new OTel Collector distribution.
+Based on the architecture, such as for Kubernetes:
+
+export GOOS=linux
+export GOARCH=amd64
+./ocb --config manifest.yaml
+
+3) If all goes well, a _build folder has been generated with the exec of our custom collector. Now we have the build, we need to convert it into an image we can to use in the Collector manifest for Kubernetes.
+There are different ways to do it, an example using minikube on Kubernetes and Docker is:
+
+- Write a Dockerfile and put it in the same folder as the exec, example:
+  
+```
+FROM gcr.io/distroless/base-debian12
+WORKDIR /otel
+COPY otelcol-workflowe2e /otel/otelcol
+EXPOSE 4317 4318 8889
+USER nonroot:nonroot
+ENTRYPOINT ["/otel/otelcol"]
+```
+
+- After that I can build the image on minikube so that the cluster sees it right away, so I start minikube and then do:
+
+eval $(minikube docker-env)
+docker build --no-cache -t workflowe2e/otelcol:0.1.0 .
+docker images | grep workflowe2e/otelcol
+
+These commands tell Minikube to use the internal Docker daemon. The image is built directly for Minikube, and you can see if it was added correctly.
+This way, Minikube will find the image directly; you don't need to push it to Docker Hub (image: workflowe2e/otelcol:0.1.0).
+
+- Then just modify the OTel Collector manifest to use the new image and custom connector and restart it, example:
+
+```
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-collector
+  namespace: observability
+spec:
+  # Let's define the image to use for the Collector, in this case it's the contrib which is the extended version that includes many additional receivers/processors/exporters/connectors
+  image: workflowe2e/otelcol:0.1.0    # Custom image for the Collector, I used the Collector contrib to which I added my custom connector
+...
+```
