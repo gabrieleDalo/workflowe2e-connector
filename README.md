@@ -122,7 +122,7 @@ docker images | grep workflowe2e/otelcol
 These commands tell Minikube to use the internal Docker daemon. The image is built directly for Minikube, and you can see if it was added correctly.
 This way, Minikube will find the image directly; you don't need to push it to Docker Hub (image: workflowe2e/otelcol:0.1.0).
 
-- Then just modify the OTel Collector manifest to use the new image and custom connector and restart it, example:
+4) Then just modify the OTel Collector manifest to use the new image and custom connector and restart it, example:
 
 ```
 apiVersion: opentelemetry.io/v1beta1
