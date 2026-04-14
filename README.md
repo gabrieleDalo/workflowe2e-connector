@@ -91,9 +91,11 @@ connectors:
 2) Use a tool such as OCB (https://github.com/open-telemetry/opentelemetry-collector/tree/main/cmd/builder) to build the new OTel Collector distribution.
 Based on the architecture, such as for Kubernetes:
 
+```
 export GOOS=linux
 export GOARCH=amd64
 ./ocb --config manifest.yaml
+```
 
 3) If all goes well, a _build folder has been generated with the exec of our custom collector. Now we have the build, we need to convert it into an image we can to use in the Collector manifest for Kubernetes.
 There are different ways to do it, an example using minikube on Kubernetes and Docker is:
@@ -110,10 +112,12 @@ ENTRYPOINT ["/otel/otelcol"]
 ```
 
 - After that I can build the image on minikube so that the cluster sees it right away, so I start minikube and then do:
-
+- 
+```
 eval $(minikube docker-env)
 docker build --no-cache -t workflowe2e/otelcol:0.1.0 .
 docker images | grep workflowe2e/otelcol
+```
 
 These commands tell Minikube to use the internal Docker daemon. The image is built directly for Minikube, and you can see if it was added correctly.
 This way, Minikube will find the image directly; you don't need to push it to Docker Hub (image: workflowe2e/otelcol:0.1.0).
