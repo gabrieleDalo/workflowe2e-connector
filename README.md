@@ -32,13 +32,15 @@ The following settings can be configured (optional):
 
 - `e2e_latency_metric_name` (default: `workflow_e2e_latency`): name used to expose the e2e latency metric;
 - `service_latency_metric_name` (default: `workflow_service_latency`): name used to expose the per-service latency metric;
-- `service_latency_mode` (default: `false`): whether to compute per-service latency as well as e2e latency, or only e2e;
+- `service_latency_mode` (default: `true`): whether to compute per-service latency as well as e2e latency, or only e2e;
 - `service_name_attribute` (default: `service.name`): the attribute name (span or resource) used to identify individual services when computing their latency;
-- `using_istio` (default: `false`): whether Istio is also used to generate spans for traces, or only OTel;
-- `n_spans_for_trace` (default: `0`): number of spans to be expected for a trace;
+- `experiment_name_attribute` (default: `experiment.name`): resource attribute from which to read the experiment name;
+- `experiment_name_header` (default: `experiment_name`): “baggage-like” key used to extract the value from the attribute;
+- `using_istio` (default: `true`): whether Istio is also used to generate spans for traces, or only OTel if false (the logic used to parse service and operation names changes);
+- `n_spans_for_trace` (default: `0`): number of spans to be expected for a trace (if 0 only the timeout mechanism is used);
 - `trace_idle_timeout` (default: `15s`): idle time (no spans received) after which a trace is considered complete and finalized (latency computed and exposed as a metric);
 - `trace_flush_interval` (default: `3s`): how often the connector checks traces and finalizes those that have expired (i.e. passed the trace_idle_timeout);
-- `db_url` (default: `3s`): URL of a database (PostgreSQL) to save data for future analysis;
+- `db_url`: URL of a database (PostgreSQL) to save data for future analysis (if used);
 
 
 ## Examples
@@ -46,34 +48,7 @@ The following settings can be configured (optional):
 The following is a simple example usage of the workflowe2e connector (taken from an OTel Collector config.yaml):  
 
 ```
-  config:
-    receivers:
-      otlp:    
-        protocols:
-          grpc:
-            endpoint: "0.0.0.0:4317"
-          http:
-            endpoint: "0.0.0.0:4318"
-    processors:  
-      batch:  
-        timeout: 200ms
-      groupbytrace:
-        wait_duration: 5s
-        num_traces: 1000 
-        num_workers: 1 
-    exporters:
-      otlp/jaeger:
-        endpoint: jaeger-collector.istio-system.svc.cluster.local:4317
-        tls:            
-          insecure: true
-        sending_queue:   
-          enabled: true
-        retry_on_failure:   
-          enabled: true
-      prometheus:
-        endpoint: "0.0.0.0:8889"
-
-    connectors:
+  connectors:
       workflowe2e:
         e2e_latency_metric_name: workflow_e2e_latency
         service_latency_metric_name: workflow_service_latency
@@ -82,22 +57,9 @@ The following is a simple example usage of the workflowe2e connector (taken from
         experiment_name_attribute: experiment.name
         experiment_name_header: experiment_name
         using_istio: true
-        n_spans_for_trace: 10      
+        n_spans_for_trace: 10
         trace_idle_timeout: 80s
         trace_flush_interval: 5s
         db_url: "postgres://user:password@postgres-service.observability.svc.cluster.local:5432/tracing_db?sslmode=disable"
-    service:
-      telemetry:
-        logs:
-          level: debug
-
-      pipelines:
-        traces: 
-          receivers: [otlp] 
-          processors: [groupbytrace,batch]  
-          exporters: [otlp/jaeger, workflowe2e] 
-        metrics/workflowe2e:
-          receivers: [workflowe2e]
-          exporters: [prometheus]
 ```
 
